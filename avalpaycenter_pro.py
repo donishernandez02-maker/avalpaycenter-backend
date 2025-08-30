@@ -115,11 +115,20 @@ class RailwayAvalPayCenterAutomation:
         chrome_options.add_argument("--disable-software-rasterizer")
         chrome_options.add_argument("--no-first-run")
         chrome_options.add_argument("--no-zygote")
-        chrome_options.add_argument("--window-size=1280,800")
+        chrome_options.add_argument("--window-size=1024,700")
         chrome_options.add_argument("--remote-debugging-port=9222")
         chrome_options.add_argument(f"--user-data-dir={tmp_dir}/user-data")
         chrome_options.add_argument(f"--data-path={tmp_dir}/data-path")
         chrome_options.add_argument(f"--disk-cache-dir={tmp_dir}/cache-dir")
+
+        # Estabilidad extra (evita throttling de timers, etc.)
+        chrome_options.add_argument("--disable-background-timer-throttling")
+        chrome_options.add_argument("--disable-renderer-backgrounding")
+        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+        chrome_options.add_argument("--disable-features=Translate,BackForwardCache,MediaRouter")
+        chrome_options.add_argument("--ignore-certificate-errors")
+        # Si persiste el crash, prueba a descomentar esta (no siempre es necesaria):
+        # chrome_options.add_argument("--single-process")
 
         logger.info(f"[Selenium] CHROME_BIN={CHROME_BIN}")
         logger.info(f"[Selenium] CHROMEDRIVER_PATH={CHROMEDRIVER_PATH}")
@@ -356,20 +365,26 @@ class RailwayAvalPayCenterAutomation:
 def get_engine() -> Optional[RailwayAvalPayCenterAutomation]:
     """
     Crea el motor SOLO cuando lo piden y si Selenium está habilitado por env.
-    Evita que el contenedor tarde en iniciar por el healthcheck.
+    Si el driver murió, lo recrea automáticamente para el siguiente request.
     """
     global automation_engine
     if not ENABLE_SELENIUM or not SELENIUM_IMPORT_OK:
         return None
+
+    # Si ya existe, confirma que sigue vivo
     if automation_engine:
-        return automation_engine
-    try:
+        try:
+            _ = automation_engine.driver.window_handles  # acceso "inocuo"
+        except Exception:
+            try:
+                automation_engine.close()
+            except Exception:
+                pass
+            automation_engine = None
+
+    if not automation_engine:
         automation_engine = RailwayAvalPayCenterAutomation()
-        return automation_engine
-    except Exception as e:
-        logger.exception("No se pudo iniciar Selenium/Chrome")
-        automation_engine = None
-        return None
+    return automation_engine
 
 # ------------------------------------------------------------------------------
 # Helpers demo
@@ -406,7 +421,7 @@ def health_check():
         "success": True,
         "status": "healthy",
         "service": "AvalPayCenter Automation API",
-        "version": "3.5.0",
+        "version": "3.6.0",
         "selenium_import_ok": SELENIUM_IMPORT_OK,
         "enable_selenium": ENABLE_SELENIUM,
         "available_endpoints": [
