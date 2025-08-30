@@ -116,7 +116,6 @@ class RailwayAvalPayCenterAutomation:
         chrome_options.add_argument("--no-first-run")
         chrome_options.add_argument("--no-zygote")
         chrome_options.add_argument("--window-size=1024,700")
-        chrome_options.add_argument("--remote-debugging-port=9222")
         chrome_options.add_argument(f"--user-data-dir={tmp_dir}/user-data")
         chrome_options.add_argument(f"--data-path={tmp_dir}/data-path")
         chrome_options.add_argument(f"--disk-cache-dir={tmp_dir}/cache-dir")
@@ -127,8 +126,14 @@ class RailwayAvalPayCenterAutomation:
         chrome_options.add_argument("--disable-backgrounding-occluded-windows")
         chrome_options.add_argument("--disable-features=Translate,BackForwardCache,MediaRouter")
         chrome_options.add_argument("--ignore-certificate-errors")
-        # Si persiste el crash, prueba a descomentar esta (no siempre es necesaria):
-        # chrome_options.add_argument("--single-process")
+
+        # Optimización de consumo: sin scrollbars, escala 1, sin imágenes
+        chrome_options.add_argument("--hide-scrollbars")
+        chrome_options.add_argument("--force-device-scale-factor=1")
+        chrome_options.add_experimental_option(
+            "prefs",
+            {"profile.managed_default_content_settings.images": 2}
+        )
 
         logger.info(f"[Selenium] CHROME_BIN={CHROME_BIN}")
         logger.info(f"[Selenium] CHROMEDRIVER_PATH={CHROMEDRIVER_PATH}")
@@ -421,7 +426,7 @@ def health_check():
         "success": True,
         "status": "healthy",
         "service": "AvalPayCenter Automation API",
-        "version": "3.6.0",
+        "version": "3.7.0",
         "selenium_import_ok": SELENIUM_IMPORT_OK,
         "enable_selenium": ENABLE_SELENIUM,
         "available_endpoints": [
@@ -475,9 +480,25 @@ def solve_captcha():
         logger.exception("Error en /api/solve-captcha")
         return jsonify({"success": False, "error": str(e)}), 500
 
+# --------- COMPLETE AUTOMATION con REINTENTO si cae DevTools ------------------
 @app.route("/api/complete-automation", methods=["POST"])
 @app.route("/api/complete-automation/", methods=["POST"])
 def complete_automation():
+    def flow(engine, ref, api_key):
+        steps = []
+        nav = engine.navigate_to_avalpaycenter_real(ref, api_key)
+        steps.append({"step": 1, "name": "navigation", "result": nav})
+        if not nav.get("success"):
+            return False, steps, nav, {"success": False, "error": "nav failed"}
+        extracted = engine.extract_payment_info_real()
+        steps.append({"step": 2, "name": "extraction", "result": extracted})
+        captcha = nav.get("captcha")
+        if not isinstance(captcha, dict):
+            captcha = engine.solve_recaptcha_real(api_key)
+        steps.append({"step": 3, "name": "captcha", "result": captcha})
+        ok = nav.get("success") and extracted.get("success") and captcha.get("success", True)
+        return bool(ok), steps, extracted, captcha
+
     try:
         data = request.get_json(force=True, silent=True) or {}
         ref = data.get("reference_number")
@@ -495,35 +516,74 @@ def complete_automation():
                 "note": "Modo demo sin Selenium"
             }), 200
 
-        steps = []
+        ok, steps, extracted, captcha = flow(engine, ref, api_key)
+        if ok:
+            return jsonify({
+                "success": True,
+                "reference": ref,
+                "steps": steps,
+                "extracted": extracted,
+                "captcha": captcha
+            }), 200
 
-        # 1) Navegar + llenar + (si hay) resolver captcha + submit
-        nav = engine.navigate_to_avalpaycenter_real(ref, api_key)
-        steps.append({"step": 1, "name": "navigation", "result": nav})
-        if not nav.get("success"):
-            return jsonify({"success": False, "steps": steps, "error": "Navegación falló"}), 500
+        # Si falló, revisa si fue por DevTools y reintenta con un driver nuevo
+        joined = str(steps)
+        if "not connected to DevTools" in joined or "disconnected" in joined.lower():
+            try:
+                engine.close()
+            except Exception:
+                pass
+            # reset del singleton
+            global automation_engine
+            automation_engine = None
+            engine = get_engine()  # nuevo driver
+            ok2, steps2, extracted2, captcha2 = flow(engine, ref, api_key)
+            return jsonify({
+                "success": bool(ok2),
+                "reference": ref,
+                "steps": steps2,
+                "extracted": extracted2,
+                "captcha": captcha2
+            }), (200 if ok2 else 500)
 
-        # 2) Extraer información del resultado
-        extracted = engine.extract_payment_info_real()
-        steps.append({"step": 2, "name": "extraction", "result": extracted})
-
-        # 3) Resultado de captcha (si navigate ya lo resolvió, úsalo; si no, intenta ahora)
-        captcha = nav.get("captcha")
-        if not isinstance(captcha, dict):
-            captcha = engine.solve_recaptcha_real(api_key)
-        steps.append({"step": 3, "name": "captcha", "result": captcha})
-
-        ok = nav.get("success") and extracted.get("success") and captcha.get("success", True)
+        # Fallo normal
         return jsonify({
-            "success": bool(ok),
+            "success": False,
             "reference": ref,
             "steps": steps,
             "extracted": extracted,
             "captcha": captcha
-        }), 200
+        }), 500
 
     except Exception as e:
-        logger.exception("Error en /api/complete-automation")
+        # Reintento también si la excepción incluye DevTools
+        msg = str(e)
+        if "not connected to DevTools" in msg or "disconnected" in msg.lower():
+            try:
+                engine = get_engine()
+                if engine:
+                    engine.close()
+            except Exception:
+                pass
+            global automation_engine
+            automation_engine = None
+            engine = get_engine()
+            try:
+                data = request.get_json(force=True, silent=True) or {}
+                ref = data.get("reference_number")
+                api_key = data.get("2captcha_api_key") or os.getenv("2CAPTCHA_API_KEY")
+                ok3, steps3, extracted3, captcha3 = flow(engine, ref, api_key)
+                return jsonify({
+                    "success": bool(ok3),
+                    "reference": ref,
+                    "steps": steps3,
+                    "extracted": extracted3,
+                    "captcha": captcha3
+                }), (200 if ok3 else 500)
+            except Exception as e2:
+                return jsonify({"success": False, "error": str(e2)}), 500
+
+        # Otras excepciones
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/session-info", methods=["GET"])
