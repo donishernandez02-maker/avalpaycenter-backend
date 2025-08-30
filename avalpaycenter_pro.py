@@ -55,56 +55,76 @@ class RailwayAvalPayCenterAutomation:
     Motor de demostración. Para navegación REAL en Railway, define:
     - ENABLE_SELENIUM=1
     - NIXPACKS_PKGS='chromium chromedriver'
-    (Opcional) CHROME_BIN, CHROMEDRIVER_PATH
+    (Opcional) 2CAPTCHA_API_KEY para captcha y CHROME_BIN / CHROMEDRIVER_PATH
     """
 
     def __init__(self):
+        """Versión robusta para contenedores Railway/Nixpacks."""
         if not SELENIUM_IMPORT_OK:
             raise RuntimeError("Selenium no está disponible en este entorno.")
 
-        # 1) Rutas desde variables o detección automática (Nixpacks suele ponerlos en /nix/store/.../bin)
+        # Preferir lo que esté en PATH (Nixpacks los deja en /root/.nix-profile/bin o /nix/store/.../bin)
         env_chrome = os.getenv("CHROME_BIN")
         env_driver = os.getenv("CHROMEDRIVER_PATH")
-
         which_chrome = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
         which_driver = shutil.which("chromedriver")
 
-        # Fallbacks clásicos
+        def pick_existing(*cands):
+            for p in cands:
+                if p and os.path.exists(p):
+                    return p
+            return None
+
         fallback_chrome = "/usr/bin/chromium"
         fallback_driver = "/usr/bin/chromedriver"
-        alt_driver = "/usr/lib/chromium/chromedriver"
+        alt_driver      = "/usr/lib/chromium/chromedriver"
 
-        CHROME_BIN = env_chrome or which_chrome or (fallback_chrome if os.path.exists(fallback_chrome) else None)
-        CHROMEDRIVER_PATH = env_driver or which_driver or \
-            (fallback_driver if os.path.exists(fallback_driver) else (alt_driver if os.path.exists(alt_driver) else None))
+        CHROME_BIN        = pick_existing(env_chrome, which_chrome, fallback_chrome)
+        CHROMEDRIVER_PATH = pick_existing(env_driver, which_driver, fallback_driver, alt_driver)
 
-        logger.info(f"[Selenium] CHROME_BIN={CHROME_BIN} exists={os.path.exists(CHROME_BIN) if CHROME_BIN else None}")
-        logger.info(f"[Selenium] CHROMEDRIVER_PATH={CHROMEDRIVER_PATH} exists={os.path.exists(CHROMEDRIVER_PATH) if CHROMEDRIVER_PATH else None}")
+        # Entornos/dirs temporales seguros (evitan crash por permisos)
+        os.environ["HOME"] = "/tmp"
+        os.environ["XDG_CACHE_HOME"] = "/tmp"
+        os.environ["XDG_CONFIG_HOME"] = "/tmp"
+        os.environ["XDG_RUNTIME_DIR"] = "/tmp"
 
-        # 2) Opciones de Chrome
+        tmp_dir = "/tmp/chrome"
+        os.makedirs(f"{tmp_dir}/user-data", exist_ok=True)
+        os.makedirs(f"{tmp_dir}/data-path", exist_ok=True)
+        os.makedirs(f"{tmp_dir}/cache-dir", exist_ok=True)
+
         chrome_options = Options()
         if CHROME_BIN:
             chrome_options.binary_location = CHROME_BIN
+
+        # Flags probadas para contenedores (Chrome 130+)
         chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-extensions")
+        chrome_options.add_argument("--disable-software-rasterizer")
+        chrome_options.add_argument("--no-first-run")
+        chrome_options.add_argument("--no-zygote")
         chrome_options.add_argument("--window-size=1280,800")
         chrome_options.add_argument("--remote-debugging-port=9222")
+        chrome_options.add_argument(f"--user-data-dir={tmp_dir}/user-data")
+        chrome_options.add_argument(f"--data-path={tmp_dir}/data-path")
+        chrome_options.add_argument(f"--disk-cache-dir={tmp_dir}/cache-dir")
 
-        # 3) Inicialización: si tenemos ruta del driver la usamos; si no, dejamos que Selenium lo encuentre en PATH
-        try:
-            if CHROMEDRIVER_PATH:
-                service = Service(CHROMEDRIVER_PATH)
-                self.driver = webdriver.Chrome(service=service, options=chrome_options)
-            else:
-                self.driver = webdriver.Chrome(options=chrome_options)
-        except Exception as e:
-            logger.exception("Falló el arranque de Chrome")
-            raise
+        logger.info(f"[Selenium] CHROME_BIN={CHROME_BIN}")
+        logger.info(f"[Selenium] CHROMEDRIVER_PATH={CHROMEDRIVER_PATH}")
+        logger.info(f"[Selenium] which chromedriver={which_driver}, which chromium={which_chrome}")
+
+        # Si tenemos ruta al driver la usamos; si no, que Selenium lo resuelva por PATH
+        if CHROMEDRIVER_PATH:
+            service = Service(CHROMEDRIVER_PATH)
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        else:
+            self.driver = webdriver.Chrome(options=chrome_options)
 
         self.wait = WebDriverWait(self.driver, 15)
-        logger.info("✅ Chrome inicializado en Railway (Nixpacks)")
+        logger.info("✅ Chrome inicializado en Railway")
 
     # ------- Métodos "reales" de demo --------
     def navigate_to_avalpaycenter_real(self, reference_number: str) -> Dict[str, Any]:
@@ -204,7 +224,7 @@ def health_check():
         "success": True,
         "status": "healthy",
         "service": "AvalPayCenter Automation API",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "selenium_import_ok": SELENIUM_IMPORT_OK,
         "enable_selenium": ENABLE_SELENIUM,
         "available_endpoints": [
@@ -249,7 +269,8 @@ def search_reference():
 def solve_captcha():
     try:
         data = request.get_json(force=True, silent=True) or {}
-        api_key = data.get("2captcha_api_key")
+        # lee del body o de la env var 2CAPTCHA_API_KEY
+        api_key = data.get("2captcha_api_key") or os.getenv("2CAPTCHA_API_KEY")
         engine = get_engine()
         if not engine:
             return jsonify({"success": True, "message": "Modo demo: no se requiere reCAPTCHA"}), 200
@@ -265,7 +286,8 @@ def complete_automation():
     try:
         data = request.get_json(force=True, silent=True) or {}
         ref = data.get("reference_number")
-        api_key = data.get("2captcha_api_key")
+        # lee del body o de la env var 2CAPTCHA_API_KEY
+        api_key = data.get("2captcha_api_key") or os.getenv("2CAPTCHA_API_KEY")
         if not ref:
             return jsonify({"success": False, "error": "Falta 'reference_number'"}), 400
 
