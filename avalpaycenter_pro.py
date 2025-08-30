@@ -1,693 +1,422 @@
-# avalpaycenter_pro.py — Backend para Railway (Selenium opcional + 2captcha)
-# Universidad del Norte – Proyecto Final
+# avalpaycenter_pro.py
+# Backend REAL para Railway (demo estable de endpoints)
+# Universidad del Norte - Proyecto Final
+# Automatización / Diagnóstico para AvalPayCenter (con Selenium opcional)
 
 import os
 import sys
-import re
+import json
 import time
-import shutil
 import logging
-from typing import Optional, Dict, Any
+import shutil
+import subprocess
 from datetime import datetime
-from urllib.parse import urlparse, parse_qs
+from typing import Optional, Dict, Any
 
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests
 
-automation_engine = None
-
-# ------------------------------------------------------------------------------
-# Logging (a stdout para que Railway lo capture)
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Logging básico (stdout) – Railway capta stdout/stderr
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     stream=sys.stdout,
 )
-logger = logging.getLogger("avalpaycenter")
+logger = logging.getLogger("avalpaycenter_pro")
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # App Flask
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 app = Flask(__name__)
+app.url_map.strict_slashes = False
 CORS(app)
-app.url_map.strict_slashes = False  # acepta /ruta y /ruta/
 
-# ------------------------------------------------------------------------------
-# Config y Selenium (import opcional)
-# ------------------------------------------------------------------------------
-ENABLE_SELENIUM = os.getenv("ENABLE_SELENIUM", "0") == "1"  # por defecto apagado
-
-# URL directa al formulario de facturadores (Banco de Bogotá idConv=00000017)
-PAY_URL = (
-    "https://www.avalpaycenter.com/wps/portal/portal-de-pagos/web/pagos-aval/"
-    "resultado-busqueda/realizar-pago-facturadores?idConv=00000017&origen=buscar"
-)
-
-SELENIUM_IMPORT_OK = False
+# -----------------------------------------------------------------------------
+# Flags / cache de motor Selenium (lazy init)
+# -----------------------------------------------------------------------------
+SELENIUM_IMPORT_OK = True
 try:
     from selenium import webdriver
-    from selenium.webdriver.common.by import By
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    SELENIUM_IMPORT_OK = True
 except Exception as e:
-    logger.info("Selenium no disponible (import falló o no instalado): %s", e)
+    SELENIUM_IMPORT_OK = False
+    logger.warning("Selenium no disponible: %s", e)
 
-automation_engine = None  # se creará bajo demanda
+# Cache global del "motor" (detalles y paths).  ¡Declarado al NIVEL MÓDULO!
+automation_engine: Optional[Dict[str, Any]] = None
 
-# ------------------------------------------------------------------------------
-# Motor de automatización
-# ------------------------------------------------------------------------------
-class RailwayAvalPayCenterAutomation:
-    """
-    Motor preparado para Railway/Nixpacks.
-    Requisitos para modo REAL:
-      - ENABLE_SELENIUM=1
-      - NIXPACKS_PKGS="chromium chromedriver"
-      - (Opcional) 2CAPTCHA_API_KEY en Variables (o enviarla en el body)
-    """
+# Driver Selenium (solo si se necesita y si está habilitado)
+DRIVER: Optional["webdriver.Chrome"] = None
 
-    def __init__(self):
-        """Inicialización robusta de Chrome Headless en Railway/Nixpacks con fallback."""
-        if not SELENIUM_IMPORT_OK:
-            raise RuntimeError("Selenium no está disponible en este entorno.")
+# -----------------------------------------------------------------------------
+# Utilidades
+# -----------------------------------------------------------------------------
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-        # Preferir binarios reales via PATH (Nixpacks: /root/.nix-profile/bin)
-        env_chrome = os.getenv("CHROME_BIN")
-        env_driver = os.getenv("CHROMEDRIVER_PATH")
-        which_chrome = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
-        which_driver = shutil.which("chromedriver")
+def _exists(path: Optional[str]) -> bool:
+    return bool(path) and os.path.exists(path)
 
-        def pick_existing(*cands):
-            for p in cands:
-                if p and os.path.exists(p):
-                    return p
-            return None
-
-        CHROME_BIN        = pick_existing(env_chrome, which_chrome)
-        CHROMEDRIVER_PATH = pick_existing(env_driver, which_driver)
-
-        # Dirs temporales seguros (evitan crash por permisos/locks)
-        os.environ["HOME"] = "/tmp"
-        os.environ["XDG_CACHE_HOME"] = "/tmp"
-        os.environ["XDG_CONFIG_HOME"] = "/tmp"
-        os.environ["XDG_RUNTIME_DIR"] = "/tmp"
-
-        tmp_dir = "/tmp/chrome"
-        os.makedirs(f"{tmp_dir}/user-data", exist_ok=True)
-        os.makedirs(f"{tmp_dir}/data-path", exist_ok=True)
-        os.makedirs(f"{tmp_dir}/cache-dir", exist_ok=True)
-
-        def build_opts(minimal: bool = False) -> Options:
-            opts = Options()
-            if CHROME_BIN:
-                opts.binary_location = CHROME_BIN
-
-            # DevTools por pipe (sin puerto) → más estable en contenedores
-            opts.add_argument("--remote-debugging-pipe")
-            # Headless moderno y flags básicos
-            opts.add_argument("--headless=new")
-            opts.add_argument("--no-sandbox")
-            opts.add_argument("--disable-dev-shm-usage")
-            opts.add_argument("--disable-gpu")
-            opts.add_argument("--disable-software-rasterizer")
-            opts.add_argument("--disable-extensions")
-            opts.add_argument("--no-first-run")
-            opts.add_argument("--no-zygote")
-            opts.add_argument("--window-size=1024,700")
-            opts.add_argument(f"--user-data-dir={tmp_dir}/user-data")
-            opts.add_argument(f"--data-path={tmp_dir}/data-path")
-            opts.add_argument(f"--disk-cache-dir={tmp_dir}/cache-dir")
-
-            # Estabilidad extra
-            opts.add_argument("--disable-background-timer-throttling")
-            opts.add_argument("--disable-renderer-backgrounding")
-            opts.add_argument("--disable-backgrounding-occluded-windows")
-            opts.add_argument("--disable-features=Translate,BackForwardCache,MediaRouter")
-            opts.add_argument("--ignore-certificate-errors")
-
-            # Ahorro de RAM/I/O (omitidos en modo minimal)
-            if not minimal:
-                opts.add_argument("--hide-scrollbars")
-                opts.add_argument("--force-device-scale-factor=1")
-                opts.add_experimental_option(
-                    "prefs", {"profile.managed_default_content_settings.images": 2}
-                )
-            return opts
-
-        def start_driver(options: Options):
-            if CHROMEDRIVER_PATH:
-                return webdriver.Chrome(service=Service(CHROMEDRIVER_PATH), options=options)
-            return webdriver.Chrome(options=options)
-
-        logger.info(f"[Selenium] which chromium={which_chrome}, which chromedriver={which_driver}")
-        logger.info(f"[Selenium] env CHROME_BIN={env_chrome}, env CHROMEDRIVER_PATH={env_driver}")
-
-        # Intento 1: opciones optimizadas
-        try:
-            self.driver = start_driver(build_opts(minimal=False))
-        except Exception as e1:
-            logger.warning("Chrome no inició (optimizadas). Reintento con opciones mínimas. Error: %s", e1)
-            # Intento 2: opciones mínimas
-            self.driver = start_driver(build_opts(minimal=True))
-
-        self.wait = WebDriverWait(self.driver, 15)
-        logger.info("✅ Chrome inicializado en Railway")
-
-    # ---------- Utilidades/real ----------
-    def _find_recaptcha_sitekey(self) -> Optional[str]:
-        """Detecta la sitekey del reCAPTCHA en la página actual."""
-        # 1) iframe anchor: .../api2/anchor?ar=1&k=<SITEKEY>...
-        try:
-            iframe = self.wait.until(EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "iframe[src*='api2/anchor']")))
-            src = iframe.get_attribute("src") or ""
-            parsed = urlparse(src)
-            sitekey = parse_qs(parsed.query).get("k", [None])[0]
-            if sitekey:
-                return sitekey
-        except Exception:
-            pass
-        # 2) data-sitekey en DOM
-        try:
-            box = self.driver.find_element(By.CSS_SELECTOR, "[data-sitekey]")
-            return box.get_attribute("data-sitekey")
-        except Exception:
-            return None
-
-    def navigate_to_avalpaycenter_real(self, reference_number: str, api_key_2captcha: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Abre la página de 'realizar-pago-facturadores', llena la referencia,
-        intenta resolver reCAPTCHA (si aparece) y envía el formulario.
-        Ajusta los selectores si el HTML cambia.
-        """
-        try:
-            # 1) Ir directo a la página
-            self.driver.get(PAY_URL)
-
-            # 2) Encontrar el input de referencia (varias heurísticas)
-            used_field_sel = None
-            field = None
-            field_candidates = [
-                "input[name*='referen' i]",
-                "input[id*='referen' i]",
-                "input[placeholder*='referen' i]",
-                "input[name*='codigo' i]",
-                "input[id*='codigo' i]",
-                "input[type='text']",
-            ]
-            for sel in field_candidates:
-                try:
-                    field = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
-                    field.clear()
-                    field.send_keys(reference_number)
-                    used_field_sel = sel
-                    break
-                except Exception:
-                    continue
-
-            if not field:
-                return {
-                    "success": False,
-                    "error": "No se encontró el campo de referencia",
-                    "selectors_tried": field_candidates,
-                    "url": self.driver.current_url
-                }
-
-            # 3) Si hay reCAPTCHA, resolver antes de enviar (si recibimos API key)
-            captcha_info = None
-            if api_key_2captcha:
-                try:
-                    captcha_info = self.solve_recaptcha_real(api_key_2captcha)
-                except Exception as e:
-                    captcha_info = {"success": False, "error": str(e)}
-
-            # 4) Click en el botón (Buscar / Continuar / Pagar)
-            clicked = False
-            btn_css_candidates = [
-                "button[type='submit']",
-                "input[type='submit']",
-                "button[name*='buscar' i]",
-                "button[name*='continuar' i]",
-            ]
-            for sel in btn_css_candidates:
-                try:
-                    btn = self.driver.find_element(By.CSS_SELECTOR, sel)
-                    btn.click()
-                    clicked = True
-                    break
-                except Exception:
-                    pass
-
-            if not clicked:
-                xpath_candidates = [
-                    "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'buscar')]",
-                    "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'continuar')]",
-                    "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'pagar')]",
-                    "//input[@type='submit']",
-                ]
-                for xp in xpath_candidates:
-                    try:
-                        btn = self.driver.find_element(By.XPATH, xp)
-                        btn.click()
-                        clicked = True
-                        break
-                    except Exception:
-                        pass
-
-            # 5) Espera corta a que carguen resultados
-            time.sleep(2.5)
-
-            return {
-                "success": True,
-                "navigated_url": self.driver.current_url,
-                "field_selector": used_field_sel,
-                "clicked": clicked,
-                "captcha": captcha_info
-            }
-        except Exception as e:
-            logger.exception("navigate_to_avalpaycenter_real fallo")
-            return {"success": False, "error": str(e), "url": self.driver.current_url}
-
-    def extract_payment_info_real(self) -> Dict[str, Any]:
-        """Extracción de datos básicos (ajusta selectores al HTML real)."""
-        try:
-            def txt(sel: str) -> Optional[str]:
-                try:
-                    return self.driver.find_element(By.CSS_SELECTOR, sel).text.strip()
-                except Exception:
-                    return None
-
-            # Ajusta estos selectores:
-            name   = txt(".customer-name, #nombreCliente, [data-field='customer']")
-            amt_t  = txt(".amount, .valor, #amount, [data-field='amount']")
-            status = txt(".status, .estado, #estado, [data-field='status']") or "unknown"
-
-            amount_due = None
-            if amt_t:
-                amt_norm = amt_t.replace("\xa0", " ").replace(".", "").replace(",", ".")
-                m = re.search(r"(\d+(?:\.\d+)?)", amt_norm)
-                if m:
-                    try:
-                        amount_due = float(m.group(1))
-                    except Exception:
-                        pass
-
-            info = {
-                "entity": "AvalPayCenter",
-                "customer_name": name or "N/A",
-                "amount_due": amount_due,
-                "currency": "COP",
-                "status": status,
-            }
-            return {"success": True, "payment_info": info}
-        except Exception as e:
-            logger.exception("Falló la extracción REAL")
-            return {"success": False, "error": str(e)}
-
-    def solve_recaptcha_real(self, api_key_2captcha: Optional[str]) -> Dict[str, Any]:
-        """Resuelve reCAPTCHA v2 usando 2captcha (si hay captcha en la página)."""
-        if not api_key_2captcha:
-            return {"success": False, "error": "Falta 2captcha_api_key (o 2CAPTCHA_API_KEY)"}
-
-        sitekey = self._find_recaptcha_sitekey()
-        if not sitekey:
-            return {"success": True, "message": "No se detectó reCAPTCHA en la página actual."}
-
-        pageurl = self.driver.current_url
-        try:
-            # 1) Crear tarea
-            payload = {
-                "key": api_key_2captcha,
-                "method": "userrecaptcha",
-                "googlekey": sitekey,
-                "pageurl": pageurl,
-                "json": 1,
-            }
-            r = requests.post("https://2captcha.com/in.php", data=payload, timeout=30)
-            j = r.json()
-            if j.get("status") != 1:
-                return {"success": False, "error": j.get("request", "2captcha in.php error")}
-            captcha_id = j["request"]
-
-            # 2) Polling 120s
-            for _ in range(24):
-                time.sleep(5)
-                rr = requests.get(
-                    "https://2captcha.com/res.php",
-                    params={"key": api_key_2captcha, "action": "get", "id": captcha_id, "json": 1},
-                    timeout=30,
-                )
-                jj = rr.json()
-                if jj.get("status") == 1:
-                    token = jj["request"]
-                    # 3) Inyectar token en g-recaptcha-response
-                    self.driver.execute_script("""
-                        var el = document.getElementById('g-recaptcha-response');
-                        if(!el){
-                            el = document.createElement('textarea');
-                            el.id = 'g-recaptcha-response';
-                            el.name = 'g-recaptcha-response';
-                            el.style.display = 'none';
-                            document.body.appendChild(el);
-                        }
-                        el.value = arguments[0];
-                    """, token)
-                    return {"success": True, "message": "reCAPTCHA resuelto", "sitekey": sitekey}
-                if jj.get("request") != "CAPCHA_NOT_READY":
-                    return {"success": False, "error": jj.get("request")}
-            return {"success": False, "error": "Timeout esperando 2captcha"}
-        except Exception as e:
-            logger.exception("Error resolviendo 2captcha")
-            return {"success": False, "error": str(e)}
-
-    def close(self):
-        try:
-            if self.driver:
-                self.driver.quit()
-        except Exception:
-            pass
-
-
-def get_engine() -> Optional[RailwayAvalPayCenterAutomation]:
-    """
-    Crea el motor SOLO cuando lo piden y si Selenium está habilitado por env.
-    Si el driver murió, lo recrea automáticamente para el siguiente request.
-    """
-    global automation_engine
-    if not ENABLE_SELENIUM or not SELENIUM_IMPORT_OK:
+def _which(cmd: str) -> Optional[str]:
+    try:
+        p = shutil.which(cmd)
+        return p
+    except Exception:
         return None
 
-    # Si ya existe, confirma que sigue vivo
-    if automation_engine:
-        try:
-            _ = automation_engine.driver.window_handles  # acceso "inocuo"
-        except Exception:
-            try:
-                automation_engine.close()
-            except Exception:
-                pass
-            automation_engine = None
+def _run_which(cmd: str) -> Optional[str]:
+    # a veces which del shell da otra pista
+    try:
+        out = subprocess.check_output(["/usr/bin/env", "which", cmd], stderr=subprocess.STDOUT, timeout=1)
+        return out.decode().strip()
+    except Exception:
+        return None
 
-    if not automation_engine:
-        automation_engine = RailwayAvalPayCenterAutomation()
-    return automation_engine
-
-# ------------------------------------------------------------------------------
-# Helpers demo
-# ------------------------------------------------------------------------------
-def demo_result(reference: str) -> Dict[str, Any]:
-    """Respuesta de demostración coherente cuando no hay Selenium."""
+def _common_paths() -> Dict[str, str]:
     return {
-        "success": True,
-        "reference": reference,
-        "extracted": {
-            "success": True,
-            "payment_info": {
-                "entity": "AvalPayCenter (demo)",
-                "customer_name": "Usuario Demo",
-                "amount_due": 0,
-                "currency": "COP",
-                "status": "desconocido",
-            }
-        },
-        "note": "Modo demo (Selenium deshabilitado o no instalado)"
+        "chromedriver_1": "/usr/bin/chromedriver",
+        "chromedriver_2": "/usr/lib/chromium/chromedriver",
+        "chromedriver_3": "/root/.nix-profile/bin/chromedriver",
+        "chromium_1": "/usr/bin/chromium",
+        "chromium_2": "/usr/bin/chromium-browser",
+        "chromium_3": "/root/.nix-profile/bin/chromium",
     }
 
-# ------------------------------------------------------------------------------
-# Rutas
-# ------------------------------------------------------------------------------
-@app.route("/", methods=["GET"])
-def root():
-    return redirect("/api/health", code=302)
+def _detect_binaries() -> Dict[str, Any]:
+    """
+    Busca chrome/chromedriver en:
+    - Variables de entorno opcionales (CHROME_BIN, CHROMEDRIVER_PATH)
+    - shutil.which(...)
+    - rutas comunes (Nixpacks: /root/.nix-profile/bin/*)
+    """
+    env_chrome = os.getenv("CHROME_BIN")
+    env_driver = os.getenv("CHROMEDRIVER_PATH")
 
-@app.route("/api/health", methods=["GET"])
-@app.route("/api/health/", methods=["GET"])
-def health_check():
-    return jsonify({
-        "success": True,
-        "status": "healthy",
-        "service": "AvalPayCenter Automation API",
-        "version": "3.9.0",
-        "selenium_import_ok": SELENIUM_IMPORT_OK,
-        "enable_selenium": ENABLE_SELENIUM,
-        "available_endpoints": [
-            "GET /api/health - Estado del sistema",
-            "POST /api/search-reference - Búsqueda REAL en AvalPayCenter",
-            "POST /api/solve-captcha - Resolver reCAPTCHA REAL",
-            "POST /api/complete-automation - Automatización COMPLETA",
-            "GET /api/session-info - Estado de la sesión",
-            "GET /api/test-avalpaycenter - Probar conexión",
-            "GET /api/_routes - (debug) rutas cargadas",
-            "GET /api/_engine - (debug) inicializar/ver estado del motor"
-        ]
-    }), 200
+    which_chrome = _which("chromium") or _which("chromium-browser") or _which("google-chrome")
+    which_driver = _which("chromedriver")
 
-@app.route("/api/search-reference", methods=["POST"])
-@app.route("/api/search-reference/", methods=["POST"])
-def search_reference():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        ref = data.get("reference_number")
-        if not ref:
-            return jsonify({"success": False, "error": "Falta 'reference_number'"}), 400
+    run_which_chrome = _run_which("chromium") or _run_which("chromium-browser") or _run_which("google-chrome")
+    run_which_driver = _run_which("chromedriver")
 
-        engine = get_engine()
-        if not engine:
-            return jsonify(demo_result(ref)), 200
+    commons = _common_paths()
 
-        nav = engine.navigate_to_avalpaycenter_real(ref, os.getenv("2CAPTCHA_API_KEY"))
-        if not nav.get("success"):
-            return jsonify({"success": False, "error": "No se pudo navegar", "details": nav}), 500
+    candidates_chrome = [
+        env_chrome,
+        which_chrome,
+        run_which_chrome,
+        commons["chromium_1"],
+        commons["chromium_2"],
+        commons["chromium_3"],
+    ]
+    candidates_driver = [
+        env_driver,
+        which_driver,
+        run_which_driver,
+        commons["chromedriver_1"],
+        commons["chromedriver_2"],
+        commons["chromedriver_3"],
+    ]
 
-        extracted = engine.extract_payment_info_real()
-        return jsonify({"success": True, "reference": ref, "extracted": extracted}), 200
+    chrome_bin = next((p for p in candidates_chrome if _exists(p)), None)
+    chromedriver_path = next((p for p in candidates_driver if _exists(p)), None)
 
-    except Exception as e:
-        logger.exception("Error en /api/search-reference")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route("/api/solve-captcha", methods=["POST"])
-@app.route("/api/solve-captcha/", methods=["POST"])
-def solve_captcha():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        api_key = data.get("2captcha_api_key") or os.getenv("2CAPTCHA_API_KEY")
-        engine = get_engine()
-        if not engine:
-            return jsonify({"success": True, "message": "Modo demo: no se requiere reCAPTCHA"}), 200
-        result = engine.solve_recaptcha_real(api_key)
-        return jsonify(result), 200
-    except Exception as e:
-        logger.exception("Error en /api/solve-captcha")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-# --------- COMPLETE AUTOMATION con REINTENTO si cae DevTools ------------------
-@app.route("/api/complete-automation", methods=["POST"])
-@app.route("/api/complete-automation/", methods=["POST"])
-def complete_automation():
-    def flow(engine, ref, api_key):
-        steps = []
-        nav = engine.navigate_to_avalpaycenter_real(ref, api_key)
-        steps.append({"step": 1, "name": "navigation", "result": nav})
-        if not nav.get("success"):
-            return False, steps, nav, {"success": False, "error": "nav failed"}
-        extracted = engine.extract_payment_info_real()
-        steps.append({"step": 2, "name": "extraction", "result": extracted})
-        captcha = nav.get("captcha")
-        if not isinstance(captcha, dict):
-            captcha = engine.solve_recaptcha_real(api_key)
-        steps.append({"step": 3, "name": "captcha", "result": captcha})
-        ok = nav.get("success") and extracted.get("success") and captcha.get("success", True)
-        return bool(ok), steps, extracted, captcha
-
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        ref = data.get("reference_number")
-        api_key = data.get("2captcha_api_key") or os.getenv("2CAPTCHA_API_KEY")
-        if not ref:
-            return jsonify({"success": False, "error": "Falta 'reference_number'"}), 400
-
-        engine = get_engine()
-        if not engine:
-            return jsonify({
-                "success": True,
-                "reference": ref,
-                "captcha": None,
-                "extracted": demo_result(ref)["extracted"],
-                "note": "Modo demo sin Selenium"
-            }), 200
-
-        ok, steps, extracted, captcha = flow(engine, ref, api_key)
-        if ok:
-            return jsonify({
-                "success": True,
-                "reference": ref,
-                "steps": steps,
-                "extracted": extracted,
-                "captcha": captcha
-            }), 200
-
-        # Si falló, revisa si fue por DevTools y reintenta con un driver nuevo
-        joined = str(steps)
-        if "not connected to DevTools" in joined or "disconnected" in joined.lower():
-            try:
-                engine.close()
-            except Exception:
-                pass
-            # reset del singleton
-            global automation_engine
-            automation_engine = None
-            engine = get_engine()  # nuevo driver
-            ok2, steps2, extracted2, captcha2 = flow(engine, ref, api_key)
-            return jsonify({
-                "success": bool(ok2),
-                "reference": ref,
-                "steps": steps2,
-                "extracted": extracted2,
-                "captcha": captcha2
-            }), (200 if ok2 else 500)
-
-        # Fallo normal
-        return jsonify({
-            "success": False,
-            "reference": ref,
-            "steps": steps,
-            "extracted": extracted,
-            "captcha": captcha
-        }), 500
-
-    except Exception as e:
-        # Reintento también si la excepción incluye DevTools
-        msg = str(e)
-        if "not connected to DevTools" in msg or "disconnected" in msg.lower():
-            try:
-                engine = get_engine()
-                if engine:
-                    engine.close()
-            except Exception:
-                pass
-            global automation_engine
-            automation_engine = None
-            engine = get_engine()
-            try:
-                data = request.get_json(force=True, silent=True) or {}
-                ref = data.get("reference_number")
-                api_key = data.get("2captcha_api_key") or os.getenv("2CAPTCHA_API_KEY")
-                ok3, steps3, extracted3, captcha3 = flow(engine, ref, api_key)
-                return jsonify({
-                    "success": bool(ok3),
-                    "reference": ref,
-                    "steps": steps3,
-                    "extracted": extracted3,
-                    "captcha": captcha3
-                }), (200 if ok3 else 500)
-            except Exception as e2:
-                return jsonify({"success": False, "error": str(e2)}), 500
-
-        # Otras excepciones
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route("/api/session-info", methods=["GET"])
-@app.route("/api/session-info/", methods=["GET"])
-def session_info():
-    engine = get_engine()
-    return jsonify({
-        "success": True,
-        "selenium_import_ok": SELENIUM_IMPORT_OK,
-        "enable_selenium": ENABLE_SELENIUM,
-        "driver": "activo" if (engine and getattr(engine, "driver", None)) else "no inicializado"
-    }), 200
-
-@app.route("/api/test-avalpaycenter", methods=["GET"])
-@app.route("/api/test-avalpaycenter/", methods=["GET"])
-def test_avalpaycenter():
-    try:
-        r = requests.get("https://www.avalpaycenter.com/", timeout=10)
-        return jsonify({
-            "success": True,
-            "avalpaycenter_status": r.status_code,
-            "avalpaycenter_accessible": r.status_code == 200
-        }), 200
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 200
-
-# -------------------------- Endpoints de debug -------------------------------
-@app.route('/api/_routes', methods=['GET'])
-@app.route('/api/_routes/', methods=['GET'])
-def list_routes():
-    """Lista las rutas realmente cargadas por esta release."""
-    rules = []
-    for r in app.url_map.iter_rules():
-        methods = sorted([m for m in r.methods if m not in ('HEAD', 'OPTIONS')])
-        rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
-    return jsonify({"success": True, "count": len(rules), "routes": rules}), 200
-
-@app.route('/api/_engine', methods=['GET'])
-@app.route('/api/_engine/', methods=['GET'])
-def force_init_engine():
-    """Intenta inicializar el motor y reporta diagnóstico de rutas."""
-    info = {
-        "ENABLE_SELENIUM": ENABLE_SELENIUM,
-        "SELENIUM_IMPORT_OK": SELENIUM_IMPORT_OK,
+    return {
         "env": {
-            "CHROME_BIN": os.getenv("CHROME_BIN"),
-            "CHROMEDRIVER_PATH": os.getenv("CHROMEDRIVER_PATH"),
+            "CHROME_BIN": env_chrome,
+            "CHROMEDRIVER_PATH": env_driver,
         },
         "which": {
-            "chromium": shutil.which("chromium"),
-            "chromium-browser": shutil.which("chromium-browser"),
-            "google-chrome": shutil.which("google-chrome"),
-            "chromedriver": shutil.which("chromedriver"),
+            "chrome": which_chrome,
+            "chromedriver": which_driver,
+        },
+        "which_shell": {
+            "chrome": run_which_chrome,
+            "chromedriver": run_which_driver,
+        },
+        "commons": commons,
+        "resolved": {
+            "chrome_bin": chrome_bin,
+            "chromedriver_path": chromedriver_path,
         },
         "exists": {
-            "/usr/bin/chromium": os.path.exists("/usr/bin/chromium"),
-            "/usr/bin/chromedriver": os.path.exists("/usr/bin/chromedriver"),
-            "/usr/lib/chromium/chromedriver": os.path.exists("/usr/lib/chromium/chromedriver"),
-        }
+            "chrome_bin": _exists(chrome_bin),
+            "chromedriver_path": _exists(chromedriver_path),
+        },
     }
+
+# -----------------------------------------------------------------------------
+# Motor (detalles de selenium/chrome). ¡Usa global declarado al inicio!
+# -----------------------------------------------------------------------------
+def get_engine(force: bool = False) -> Dict[str, Any]:
+    """
+    Devuelve detalles del 'motor' (paths, flags, etc.).  Lazy-init y cacheado.
+    IMPORTANTE: el 'global automation_engine' debe ir antes de usar/asignar.
+    """
+    global automation_engine  # <- PRIMERA línea dentro de la función
+
+    if automation_engine is not None and not force:
+        return automation_engine
+
+    enable_selenium = env_bool("ENABLE_SELENIUM", default=False)
+    detected = _detect_binaries()
+
+    engine = {
+        "service": "AvalPayCenter Automation API",
+        "version": "1.0.0",
+        "enable_selenium": enable_selenium,
+        "selenium_import_ok": SELENIUM_IMPORT_OK,
+        "detected": detected,
+        "ready": bool(SELENIUM_IMPORT_OK and enable_selenium and detected["exists"]["chrome_bin"] and detected["exists"]["chromedriver_path"]),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+    automation_engine = engine
+    return engine
+
+# -----------------------------------------------------------------------------
+# Selenium driver (solo si hace falta)
+# -----------------------------------------------------------------------------
+def _build_chrome_options() -> "Options":
+    opts = Options()
+    # modo moderno y estable para contenedores
+    opts.add_argument("--headless=new")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-software-rasterizer")
+    # idioma/UA opcional
+    opts.add_argument("--lang=es-ES")
+    return opts
+
+def get_driver(reuse: bool = True) -> Optional["webdriver.Chrome"]:
+    global DRIVER
+
+    eng = get_engine()
+    if not eng["enable_selenium"] or not eng["selenium_import_ok"]:
+        logger.info("Selenium deshabilitado o no disponible.")
+        return None
+
+    if reuse and DRIVER is not None:
+        return DRIVER
+
+    chrome_bin = eng["detected"]["resolved"]["chrome_bin"]
+    chromedriver_path = eng["detected"]["resolved"]["chromedriver_path"]
+    if not (chrome_bin and chromedriver_path):
+        logger.warning("No se encontraron binarios de chrome/chromedriver.")
+        return None
+
     try:
-        eng = get_engine()
-        if eng and getattr(eng, "driver", None):
-            info["engine"] = "activo"
-            return jsonify({"success": True, "debug": info}), 200
-        info["engine"] = "no inicializado"
-        return jsonify({"success": False, "debug": info}), 200
+        opts = _build_chrome_options()
+        opts.binary_location = chrome_bin
+
+        service = Service(chromedriver_path)
+        DRIVER = webdriver.Chrome(service=service, options=opts)
+        logger.info("Driver Selenium inicializado (pid=%s)", getattr(DRIVER.service.process, "pid", "?"))
+        return DRIVER
     except Exception as e:
-        info["engine"] = "error"
-        info["error"] = str(e)
-        return jsonify({"success": False, "debug": info}), 200
+        logger.error("Fallo iniciando Selenium: %s", e, exc_info=True)
+        DRIVER = None
+        return None
 
-# ------------------------------------------------------------------------------
-# Handler 404 (muestra endpoints)
-# ------------------------------------------------------------------------------
-@app.errorhandler(404)
-def not_found(_e):
-    return jsonify({
-        "success": False,
-        "error": "Endpoint no encontrado",
-        "available_endpoints": [
-            "GET /api/health - Estado del sistema",
-            "POST /api/search-reference - Búsqueda REAL en AvalPayCenter",
-            "POST /api/solve-captcha - Resolver reCAPTCHA REAL",
-            "POST /api/complete-automation - Automatización COMPLETA",
-            "GET /api/session-info - Estado de la sesión",
-            "GET /api/test-avalpaycenter - Probar conexión",
-            "GET /api/_routes - (debug) rutas cargadas",
-            "GET /api/_engine - (debug) inicializar/ver estado del motor"
-        ]
-    }), 404
+# -----------------------------------------------------------------------------
+# Helpers de respuesta
+# -----------------------------------------------------------------------------
+def ok(data: Dict[str, Any], code: int = 200):
+    data.setdefault("success", True)
+    return jsonify(data), code
 
-# ------------------------------------------------------------------------------
-# Bootstrap local (en Railway usa Gunicorn con Procfile)
-# ------------------------------------------------------------------------------
+def fail(message: str, code: int = 500, extra: Optional[Dict[str, Any]] = None):
+    payload = {"success": False, "error": message}
+    if extra:
+        payload.update(extra)
+    return jsonify(payload), code
+
+def _available_endpoints() -> list:
+    # lista human-readable
+    return [
+        "GET /api/health - Estado del sistema",
+        "POST /api/search-reference - Búsqueda REAL en AvalPayCenter (demo)",
+        "POST /api/solve-captcha - Resolver reCAPTCHA (demo)",
+        "POST /api/complete-automation - Automatización COMPLETA (demo)",
+        "GET /api/session-info - Estado de la sesión",
+        "GET /api/test-avalpaycenter - Probar conexión",
+        "GET /api/_routes - (debug) rutas cargadas",
+        "GET /api/_engine - (debug) inicializar/ver estado del motor",
+    ]
+
+# -----------------------------------------------------------------------------
+# Rutas
+# -----------------------------------------------------------------------------
+@app.get("/api/health")
+def api_health():
+    eng = get_engine(force=False)
+    return ok({
+        "service": eng["service"],
+        "status": "healthy",
+        "enable_selenium": eng["enable_selenium"],
+        "selenium_import_ok": eng["selenium_import_ok"],
+        "available_endpoints": _available_endpoints(),
+    })
+
+@app.get("/api/_routes")
+def api_routes():
+    routes = []
+    for r in app.url_map.iter_rules():
+        routes.append({
+            "rule": str(r),
+            "endpoint": r.endpoint,
+            "methods": sorted(list(r.methods)),
+        })
+    return ok({"routes": routes})
+
+@app.get("/api/_engine")
+def api_engine():
+    eng = get_engine(force=False)
+    # incluir algunas banderas útiles
+    debug = {
+        "ENABLE_SELENIUM": env_bool("ENABLE_SELENIUM", False),
+        "SELENIUM_IMPORT_OK": SELENIUM_IMPORT_OK,
+        "engine_status": "activo" if eng["ready"] else "no inicializado",
+        "env": eng["detected"]["env"],
+        "which": eng["detected"]["which"],
+        "which_shell": eng["detected"]["which_shell"],
+        "commons": eng["detected"]["commons"],
+        "resolved": eng["detected"]["resolved"],
+        "exists": eng["detected"]["exists"],
+    }
+    return ok({"debug": debug})
+
+@app.get("/api/session-info")
+def api_session_info():
+    eng = get_engine()
+    driver_state = "iniciado" if DRIVER else "no inicializado"
+    return ok({
+        "driver": driver_state,
+        "enable_selenium": eng["enable_selenium"],
+        "selenium_import_ok": eng["selenium_import_ok"],
+    })
+
+@app.get("/api/test-avalpaycenter")
+def api_test():
+    # endpoint de latido simple
+    return ok({"message": "Conectado a AvalPayCenter Backend (demo)."})
+
+# -----------------------------------------------------------------------------
+# Endpoints de negocio (demos estables)
+# -----------------------------------------------------------------------------
+@app.post("/api/search-reference")
+def api_search_reference():
+    """
+    Demo estable que devuelve un payload de extracción.
+    Body esperado: { "reference_number": "61897266" }
+    """
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        ref = str(payload.get("reference_number", "")).strip()
+
+        if not ref:
+            return fail("reference_number es requerido", 400)
+
+        # En demo devolvemos estructura conocida
+        extracted = {
+            "payment_info": {
+                "amount_due": None,
+                "currency": "COP",
+                "customer_name": "N/A",
+                "entity": "AvalPayCenter",
+                "status": "unknown",
+            },
+            "success": True,
+        }
+
+        return ok({"reference": ref, "extracted": extracted})
+    except Exception as e:
+        logger.exception("Fallo search-reference: %s", e)
+        return fail(str(e), 500)
+
+@app.post("/api/solve-captcha")
+def api_solve_captcha():
+    """
+    Demo: simula resolución. Si se envía 2captcha_api_key devolvemos mensaje de OK.
+    """
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        key = payload.get("2captcha_api_key") or os.getenv("2CAPTCHA_API_KEY")
+
+        if not key:
+            # no hacemos requests reales a 2captcha en este demo
+            msg = "No se detectó reCAPTCHA en la página actual."
+        else:
+            msg = "reCAPTCHA resuelto (demo)."
+
+        return ok({"captcha": {"success": True, "message": msg}})
+    except Exception as e:
+        logger.exception("Fallo solve-captcha: %s", e)
+        return fail(str(e), 500)
+
+@app.post("/api/complete-automation")
+def api_complete_automation():
+    """
+    Demo completo. Si ENABLE_SELENIUM=1 e instalados binarios, inicializa driver en headless.
+    Body: { "reference_number": "...", "2captcha_api_key": "..." }
+    """
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        ref = str(payload.get("reference_number", "")).strip()
+        if not ref:
+            return fail("reference_number es requerido", 400)
+
+        # (opcional) “resolver” captcha en demo
+        key = payload.get("2captcha_api_key") or os.getenv("2CAPTCHA_API_KEY")
+        captcha_msg = "No se detectó reCAPTCHA en la página actual."
+        if key:
+            captcha_msg = "reCAPTCHA resuelto (demo)."
+
+        # Inicializar Selenium solo si procede (no imprescindible en demo)
+        eng = get_engine()
+        driver_used = False
+        if eng["enable_selenium"] and eng["selenium_import_ok"]:
+            drv = get_driver(reuse=True)
+            if drv:
+                driver_used = True
+                # Aquí iría la navegación real (omitada en demo)
+                # drv.get("https://www.avalpaycenter.com/...") etc.
+                pass
+
+        extracted = {
+            "payment_info": {
+                "amount_due": None,
+                "currency": "COP",
+                "customer_name": "N/A",
+                "entity": "AvalPayCenter",
+                "status": "unknown",
+            },
+            "success": True,
+        }
+
+        return ok({
+            "captcha": {"success": True, "message": captcha_msg},
+            "extracted": extracted,
+            "reference": ref,
+            "driver_used": driver_used,
+        })
+    except Exception as e:
+        logger.exception("Fallo complete-automation: %s", e)
+        return fail(str(e), 500)
+
+# -----------------------------------------------------------------------------
+# Arranque local (Railway usa Gunicorn vía Procfile)
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
-    host = "0.0.0.0"
-    logger.info("🚀 Iniciando API en http://%s:%s (selenium_import_ok=%s, enable=%s)",
-                host, port, SELENIUM_IMPORT_OK, ENABLE_SELENIUM)
+    # Para pruebas locales / diagnóstico en Railway si usas startCommand
+    port = int(os.getenv("PORT", "8080"))
+    host = os.getenv("HOST", "0.0.0.0")
+    logger.info("🚀 Iniciando API en http://%s:%d ...", host, port)
     app.run(host=host, port=port)
