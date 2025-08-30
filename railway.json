@@ -1,9 +1,4 @@
 {
-  "build": {
-    "builder": "nixpacks"
-  },
-  "deploy": {
-    "startCommand": "python avalpaycenter_pro.py",
-    "healthcheckPath": "/api/health"
-  }
+  "build": { "builder": "nixpacks" },
+  "deploy": { "healthcheckPath": "/api/health" }
 }
