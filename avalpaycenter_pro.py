@@ -23,6 +23,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.url_map.strict_slashes = False
+
 CORS(app)
 
 # Solo importar Selenium si está disponible (Railway lo instalará)
