@@ -6,6 +6,7 @@ import sys
 import logging
 from typing import Optional, Dict, Any
 from datetime import datetime
+import shutil
 
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -46,7 +47,6 @@ except Exception as e:
 ENABLE_SELENIUM = os.getenv("ENABLE_SELENIUM", "0") == "1"  # por defecto apagado
 automation_engine = None  # se creará bajo demanda
 
-
 # ------------------------------------------------------------------------------
 # Motor de automatización (mínimo viable + hooks para real)
 # ------------------------------------------------------------------------------
@@ -62,15 +62,29 @@ class RailwayAvalPayCenterAutomation:
         if not SELENIUM_IMPORT_OK:
             raise RuntimeError("Selenium no está disponible en este entorno.")
 
-        # Rutas por defecto de Nixpacks (Railway) + override por variables
-        CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium")
-        CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+        # 1) Rutas desde variables o detección automática (Nixpacks suele ponerlos en /nix/store/.../bin)
+        env_chrome = os.getenv("CHROME_BIN")
+        env_driver = os.getenv("CHROMEDRIVER_PATH")
 
-        logger.info(f"Usando CHROME_BIN={CHROME_BIN} (exists={os.path.exists(CHROME_BIN)})")
-        logger.info(f"Usando CHROMEDRIVER_PATH={CHROMEDRIVER_PATH} (exists={os.path.exists(CHROMEDRIVER_PATH)})")
+        which_chrome = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
+        which_driver = shutil.which("chromedriver")
 
+        # Fallbacks clásicos
+        fallback_chrome = "/usr/bin/chromium"
+        fallback_driver = "/usr/bin/chromedriver"
+        alt_driver = "/usr/lib/chromium/chromedriver"
+
+        CHROME_BIN = env_chrome or which_chrome or (fallback_chrome if os.path.exists(fallback_chrome) else None)
+        CHROMEDRIVER_PATH = env_driver or which_driver or \
+            (fallback_driver if os.path.exists(fallback_driver) else (alt_driver if os.path.exists(alt_driver) else None))
+
+        logger.info(f"[Selenium] CHROME_BIN={CHROME_BIN} exists={os.path.exists(CHROME_BIN) if CHROME_BIN else None}")
+        logger.info(f"[Selenium] CHROMEDRIVER_PATH={CHROMEDRIVER_PATH} exists={os.path.exists(CHROMEDRIVER_PATH) if CHROMEDRIVER_PATH else None}")
+
+        # 2) Opciones de Chrome
         chrome_options = Options()
-        chrome_options.binary_location = CHROME_BIN
+        if CHROME_BIN:
+            chrome_options.binary_location = CHROME_BIN
         chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
@@ -78,23 +92,21 @@ class RailwayAvalPayCenterAutomation:
         chrome_options.add_argument("--window-size=1280,800")
         chrome_options.add_argument("--remote-debugging-port=9222")
 
-        service = Service(CHROMEDRIVER_PATH)
+        # 3) Inicialización: si tenemos ruta del driver la usamos; si no, dejamos que Selenium lo encuentre en PATH
         try:
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+            if CHROMEDRIVER_PATH:
+                service = Service(CHROMEDRIVER_PATH)
+                self.driver = webdriver.Chrome(service=service, options=chrome_options)
+            else:
+                self.driver = webdriver.Chrome(options=chrome_options)
         except Exception as e:
-            logger.warning("Primer intento de Chrome falló (%s). Probando rutas alternas…", e)
-            # Alternativas comunes en imágenes Debian/Ubuntu
-            alt_bin = "/usr/bin/chromium-browser"
-            alt_drv = "/usr/lib/chromium/chromedriver"
-            if os.path.exists(alt_bin):
-                chrome_options.binary_location = alt_bin
-            if os.path.exists(alt_drv):
-                service = Service(alt_drv)
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+            logger.exception("Falló el arranque de Chrome")
+            raise
 
         self.wait = WebDriverWait(self.driver, 15)
-        logger.info("✅ Chrome inicializado en Railway")
+        logger.info("✅ Chrome inicializado en Railway (Nixpacks)")
 
+    # ------- Métodos "reales" de demo --------
     def navigate_to_avalpaycenter_real(self, reference_number: str) -> Dict[str, Any]:
         try:
             url = "https://www.avalpaycenter.com/"
@@ -157,7 +169,6 @@ def get_engine() -> Optional[RailwayAvalPayCenterAutomation]:
         automation_engine = None
         return None
 
-
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
@@ -179,14 +190,12 @@ def demo_result(reference: str) -> Dict[str, Any]:
         "note": "Modo demo (Selenium deshabilitado o no instalado)"
     }
 
-
 # ------------------------------------------------------------------------------
 # Rutas
 # ------------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def root():
     return redirect("/api/health", code=302)
-
 
 @app.route("/api/health", methods=["GET"])
 @app.route("/api/health/", methods=["GET"])
@@ -195,7 +204,7 @@ def health_check():
         "success": True,
         "status": "healthy",
         "service": "AvalPayCenter Automation API",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "selenium_import_ok": SELENIUM_IMPORT_OK,
         "enable_selenium": ENABLE_SELENIUM,
         "available_endpoints": [
@@ -209,7 +218,6 @@ def health_check():
             "GET /api/_engine - (debug) inicializar/ver estado del motor"
         ]
     }), 200
-
 
 @app.route("/api/search-reference", methods=["POST"])
 @app.route("/api/search-reference/", methods=["POST"])
@@ -236,7 +244,6 @@ def search_reference():
         logger.exception("Error en /api/search-reference")
         return jsonify({"success": False, "error": str(e)}), 500
 
-
 @app.route("/api/solve-captcha", methods=["POST"])
 @app.route("/api/solve-captcha/", methods=["POST"])
 def solve_captcha():
@@ -251,7 +258,6 @@ def solve_captcha():
     except Exception as e:
         logger.exception("Error en /api/solve-captcha")
         return jsonify({"success": False, "error": str(e)}), 500
-
 
 @app.route("/api/complete-automation", methods=["POST"])
 @app.route("/api/complete-automation/", methods=["POST"])
@@ -298,7 +304,6 @@ def complete_automation():
         logger.exception("Error en /api/complete-automation")
         return jsonify({"success": False, "error": str(e)}), 500
 
-
 @app.route("/api/session-info", methods=["GET"])
 @app.route("/api/session-info/", methods=["GET"])
 def session_info():
@@ -309,7 +314,6 @@ def session_info():
         "enable_selenium": ENABLE_SELENIUM,
         "driver": "activo" if (engine and getattr(engine, "driver", None)) else "no inicializado"
     }), 200
-
 
 @app.route("/api/test-avalpaycenter", methods=["GET"])
 @app.route("/api/test-avalpaycenter/", methods=["GET"])
@@ -324,7 +328,6 @@ def test_avalpaycenter():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 200
 
-
 # -------------------------- Endpoints de debug -------------------------------
 @app.route('/api/_routes', methods=['GET'])
 @app.route('/api/_routes/', methods=['GET'])
@@ -336,19 +339,40 @@ def list_routes():
         rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
     return jsonify({"success": True, "count": len(rules), "routes": rules}), 200
 
-
 @app.route('/api/_engine', methods=['GET'])
 @app.route('/api/_engine/', methods=['GET'])
 def force_init_engine():
-    """Intenta inicializar el motor y reporta su estado (para diagnóstico)."""
+    """Intenta inicializar el motor y reporta diagnóstico de rutas."""
+    info = {
+        "ENABLE_SELENIUM": ENABLE_SELENIUM,
+        "SELENIUM_IMPORT_OK": SELENIUM_IMPORT_OK,
+        "env": {
+            "CHROME_BIN": os.getenv("CHROME_BIN"),
+            "CHROMEDRIVER_PATH": os.getenv("CHROMEDRIVER_PATH"),
+        },
+        "which": {
+            "chromium": shutil.which("chromium"),
+            "chromium-browser": shutil.which("chromium-browser"),
+            "google-chrome": shutil.which("google-chrome"),
+            "chromedriver": shutil.which("chromedriver"),
+        },
+        "exists": {
+            "/usr/bin/chromium": os.path.exists("/usr/bin/chromium"),
+            "/usr/bin/chromedriver": os.path.exists("/usr/bin/chromedriver"),
+            "/usr/lib/chromium/chromedriver": os.path.exists("/usr/lib/chromium/chromedriver"),
+        }
+    }
     try:
         eng = get_engine()
         if eng and getattr(eng, "driver", None):
-            return jsonify({"success": True, "engine": "activo"}), 200
-        return jsonify({"success": False, "engine": "no inicializado"}), 200
+            info["engine"] = "activo"
+            return jsonify({"success": True, "debug": info}), 200
+        info["engine"] = "no inicializado"
+        return jsonify({"success": False, "debug": info}), 200
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 200
-
+        info["engine"] = "error"
+        info["error"] = str(e)
+        return jsonify({"success": False, "debug": info}), 200
 
 # ------------------------------------------------------------------------------
 # Handler 404 (muestra endpoints)
@@ -369,7 +393,6 @@ def not_found(_e):
             "GET /api/_engine - (debug) inicializar/ver estado del motor"
         ]
     }), 404
-
 
 # ------------------------------------------------------------------------------
 # Bootstrap local (en Railway usa Gunicorn con Procfile)
