@@ -3,10 +3,13 @@
 
 import os
 import sys
+import re
+import time
+import shutil
 import logging
 from typing import Optional, Dict, Any
 from datetime import datetime
-import shutil
+from urllib.parse import urlparse, parse_qs
 
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -52,14 +55,15 @@ automation_engine = None  # se creará bajo demanda
 # ------------------------------------------------------------------------------
 class RailwayAvalPayCenterAutomation:
     """
-    Motor de demostración. Para navegación REAL en Railway, define:
-    - ENABLE_SELENIUM=1
-    - NIXPACKS_PKGS='chromium chromedriver'
-    (Opcional) 2CAPTCHA_API_KEY para captcha y CHROME_BIN / CHROMEDRIVER_PATH
+    Motor preparado para Railway/Nixpacks.
+    Requisitos para modo REAL:
+      - ENABLE_SELENIUM=1
+      - NIXPACKS_PKGS="chromium chromedriver"
+      - (Opcional) 2CAPTCHA_API_KEY en Variables (o envíala en el body)
     """
 
     def __init__(self):
-        """Versión robusta para contenedores Railway/Nixpacks."""
+        """Inicialización robusta de Chrome Headless en contenedor Railway."""
         if not SELENIUM_IMPORT_OK:
             raise RuntimeError("Selenium no está disponible en este entorno.")
 
@@ -82,7 +86,7 @@ class RailwayAvalPayCenterAutomation:
         CHROME_BIN        = pick_existing(env_chrome, which_chrome, fallback_chrome)
         CHROMEDRIVER_PATH = pick_existing(env_driver, which_driver, fallback_driver, alt_driver)
 
-        # Entornos/dirs temporales seguros (evitan crash por permisos)
+        # Entornos/dirs temporales seguros (evitan crash por permisos/locks)
         os.environ["HOME"] = "/tmp"
         os.environ["XDG_CACHE_HOME"] = "/tmp"
         os.environ["XDG_CONFIG_HOME"] = "/tmp"
@@ -126,12 +130,32 @@ class RailwayAvalPayCenterAutomation:
         self.wait = WebDriverWait(self.driver, 15)
         logger.info("✅ Chrome inicializado en Railway")
 
-    # ------- Métodos "reales" de demo --------
+    # ---------- Utilidades/real ----------
+    def _find_recaptcha_sitekey(self) -> Optional[str]:
+        """Detecta la sitekey del reCAPTCHA en la página actual."""
+        # 1) iframe de anchor: .../api2/anchor?ar=1&k=<SITEKEY>...
+        try:
+            iframe = self.wait.until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "iframe[src*='api2/anchor']")))
+            src = iframe.get_attribute("src") or ""
+            parsed = urlparse(src)
+            sitekey = parse_qs(parsed.query).get("k", [None])[0]
+            if sitekey:
+                return sitekey
+        except Exception:
+            pass
+        # 2) data-sitekey directo en DOM
+        try:
+            box = self.driver.find_element(By.CSS_SELECTOR, "[data-sitekey]")
+            return box.get_attribute("data-sitekey")
+        except Exception:
+            return None
+
     def navigate_to_avalpaycenter_real(self, reference_number: str) -> Dict[str, Any]:
         try:
             url = "https://www.avalpaycenter.com/"
             self.driver.get(url)
-            # Aquí irían interacciones reales con el sitio (inputs/botones/etc)
+            # TODO: aquí van las interacciones reales (inputs/clicks) según el flujo
             return {
                 "success": True,
                 "navigated_url": url,
@@ -143,14 +167,35 @@ class RailwayAvalPayCenterAutomation:
             return {"success": False, "error": str(e)}
 
     def extract_payment_info_real(self) -> Dict[str, Any]:
+        """Ejemplo de extracción (ajusta selectores al HTML real)."""
         try:
-            # En un caso real, se extrae del DOM. Demo:
+            def txt(sel: str) -> Optional[str]:
+                try:
+                    return self.driver.find_element(By.CSS_SELECTOR, sel).text.strip()
+                except Exception:
+                    return None
+
+            # Ajusta estos selectores:
+            name   = txt(".customer-name, #nombreCliente, [data-field='customer']")
+            amt_t  = txt(".amount, .valor, #amount, [data-field='amount']")
+            status = txt(".status, .estado, #estado, [data-field='status']") or "unknown"
+
+            amount_due = None
+            if amt_t:
+                amt_norm = amt_t.replace("\xa0", " ").replace(".", "").replace(",", ".")
+                m = re.search(r"(\d+(?:\.\d+)?)", amt_norm)
+                if m:
+                    try:
+                        amount_due = float(m.group(1))
+                    except Exception:
+                        pass
+
             info = {
                 "entity": "AvalPayCenter",
-                "customer_name": "N/A",
-                "amount_due": None,
+                "customer_name": name or "N/A",
+                "amount_due": amount_due,
                 "currency": "COP",
-                "status": "unknown",
+                "status": status,
             }
             return {"success": True, "payment_info": info}
         except Exception as e:
@@ -158,10 +203,60 @@ class RailwayAvalPayCenterAutomation:
             return {"success": False, "error": str(e)}
 
     def solve_recaptcha_real(self, api_key_2captcha: Optional[str]) -> Dict[str, Any]:
+        """Resuelve reCAPTCHA v2 usando 2captcha (si hay captcha en la página)."""
         if not api_key_2captcha:
-            return {"success": True, "message": "No se requiere resolver reCAPTCHA"}
-        # Aquí integrarías 2captcha si el sitio lo pide realmente
-        return {"success": True, "message": "reCAPTCHA resuelto (demo)"}
+            return {"success": False, "error": "Falta 2captcha_api_key (o 2CAPTCHA_API_KEY)"}
+
+        sitekey = self._find_recaptcha_sitekey()
+        if not sitekey:
+            return {"success": True, "message": "No se detectó reCAPTCHA en la página actual."}
+
+        pageurl = self.driver.current_url
+        try:
+            # 1) Crear tarea
+            payload = {
+                "key": api_key_2captcha,
+                "method": "userrecaptcha",
+                "googlekey": sitekey,
+                "pageurl": pageurl,
+                "json": 1,
+            }
+            r = requests.post("https://2captcha.com/in.php", data=payload, timeout=30)
+            j = r.json()
+            if j.get("status") != 1:
+                return {"success": False, "error": j.get("request", "2captcha in.php error")}
+            captcha_id = j["request"]
+
+            # 2) Polling 120s
+            for _ in range(24):
+                time.sleep(5)
+                rr = requests.get(
+                    "https://2captcha.com/res.php",
+                    params={"key": api_key_2captcha, "action": "get", "id": captcha_id, "json": 1},
+                    timeout=30,
+                )
+                jj = rr.json()
+                if jj.get("status") == 1:
+                    token = jj["request"]
+                    # 3) Inyectar token
+                    self.driver.execute_script("""
+                        var el = document.getElementById('g-recaptcha-response');
+                        if(!el){
+                            el = document.createElement('textarea');
+                            el.id = 'g-recaptcha-response';
+                            el.name = 'g-recaptcha-response';
+                            el.style.display = 'none';
+                            document.body.appendChild(el);
+                        }
+                        el.value = arguments[0];
+                    """, token)
+                    return {"success": True, "message": "reCAPTCHA resuelto", "sitekey": sitekey}
+                if jj.get("request") != "CAPCHA_NOT_READY":
+                    return {"success": False, "error": jj.get("request")}
+            return {"success": False, "error": "Timeout esperando 2captcha"}
+        except Exception as e:
+            logger.exception("Error resolviendo 2captcha")
+            return {"success": False, "error": str(e)}
 
     def close(self):
         try:
@@ -190,7 +285,7 @@ def get_engine() -> Optional[RailwayAvalPayCenterAutomation]:
         return None
 
 # ------------------------------------------------------------------------------
-# Helpers
+# Helpers demo
 # ------------------------------------------------------------------------------
 def demo_result(reference: str) -> Dict[str, Any]:
     """Respuesta de demostración coherente cuando no hay Selenium."""
@@ -224,7 +319,7 @@ def health_check():
         "success": True,
         "status": "healthy",
         "service": "AvalPayCenter Automation API",
-        "version": "3.3.0",
+        "version": "3.4.0",
         "selenium_import_ok": SELENIUM_IMPORT_OK,
         "enable_selenium": ENABLE_SELENIUM,
         "available_endpoints": [
@@ -250,7 +345,6 @@ def search_reference():
 
         engine = get_engine()
         if not engine:
-            # Sin Selenium → demo
             return jsonify(demo_result(ref)), 200
 
         nav = engine.navigate_to_avalpaycenter_real(ref)
@@ -269,7 +363,6 @@ def search_reference():
 def solve_captcha():
     try:
         data = request.get_json(force=True, silent=True) or {}
-        # lee del body o de la env var 2CAPTCHA_API_KEY
         api_key = data.get("2captcha_api_key") or os.getenv("2CAPTCHA_API_KEY")
         engine = get_engine()
         if not engine:
@@ -286,7 +379,6 @@ def complete_automation():
     try:
         data = request.get_json(force=True, silent=True) or {}
         ref = data.get("reference_number")
-        # lee del body o de la env var 2CAPTCHA_API_KEY
         api_key = data.get("2captcha_api_key") or os.getenv("2CAPTCHA_API_KEY")
         if not ref:
             return jsonify({"success": False, "error": "Falta 'reference_number'"}), 400
