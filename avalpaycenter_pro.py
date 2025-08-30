@@ -36,6 +36,8 @@ app.url_map.strict_slashes = False  # acepta /ruta y /ruta/
 # Config y Selenium (import opcional)
 # ------------------------------------------------------------------------------
 ENABLE_SELENIUM = os.getenv("ENABLE_SELENIUM", "0") == "1"  # por defecto apagado
+
+# URL directa al formulario de facturadores (Banco de Bogotá idConv=00000017)
 PAY_URL = (
     "https://www.avalpaycenter.com/wps/portal/portal-de-pagos/web/pagos-aval/"
     "resultado-busqueda/realizar-pago-facturadores?idConv=00000017&origen=buscar"
@@ -68,11 +70,11 @@ class RailwayAvalPayCenterAutomation:
     """
 
     def __init__(self):
-        """Inicialización robusta de Chrome Headless en contenedor Railway."""
+        """Inicialización robusta de Chrome Headless en Railway/Nixpacks con fallback."""
         if not SELENIUM_IMPORT_OK:
             raise RuntimeError("Selenium no está disponible en este entorno.")
 
-        # Preferir binarios en PATH (Nixpacks suele dejarlos en /root/.nix-profile/bin o /nix/store/.../bin)
+        # Preferir binarios reales via PATH (Nixpacks: /root/.nix-profile/bin)
         env_chrome = os.getenv("CHROME_BIN")
         env_driver = os.getenv("CHROMEDRIVER_PATH")
         which_chrome = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
@@ -84,14 +86,10 @@ class RailwayAvalPayCenterAutomation:
                     return p
             return None
 
-        fallback_chrome = "/usr/bin/chromium"
-        fallback_driver = "/usr/bin/chromedriver"
-        alt_driver      = "/usr/lib/chromium/chromedriver"
+        CHROME_BIN        = pick_existing(env_chrome, which_chrome)
+        CHROMEDRIVER_PATH = pick_existing(env_driver, which_driver)
 
-        CHROME_BIN        = pick_existing(env_chrome, which_chrome, fallback_chrome)
-        CHROMEDRIVER_PATH = pick_existing(env_driver, which_driver, fallback_driver, alt_driver)
-
-        # Entornos/dirs temporales seguros (evitan crash por permisos/locks)
+        # Dirs temporales seguros (evitan crash por permisos/locks)
         os.environ["HOME"] = "/tmp"
         os.environ["XDG_CACHE_HOME"] = "/tmp"
         os.environ["XDG_CONFIG_HOME"] = "/tmp"
@@ -102,49 +100,58 @@ class RailwayAvalPayCenterAutomation:
         os.makedirs(f"{tmp_dir}/data-path", exist_ok=True)
         os.makedirs(f"{tmp_dir}/cache-dir", exist_ok=True)
 
-        chrome_options = Options()
-        if CHROME_BIN:
-            chrome_options.binary_location = CHROME_BIN
+        def build_opts(minimal: bool = False) -> Options:
+            opts = Options()
+            if CHROME_BIN:
+                opts.binary_location = CHROME_BIN
 
-        # Flags probadas para contenedores (Chrome 130+)
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--disable-software-rasterizer")
-        chrome_options.add_argument("--no-first-run")
-        chrome_options.add_argument("--no-zygote")
-        chrome_options.add_argument("--window-size=1024,700")
-        chrome_options.add_argument(f"--user-data-dir={tmp_dir}/user-data")
-        chrome_options.add_argument(f"--data-path={tmp_dir}/data-path")
-        chrome_options.add_argument(f"--disk-cache-dir={tmp_dir}/cache-dir")
+            # DevTools por pipe (sin puerto) → más estable en contenedores
+            opts.add_argument("--remote-debugging-pipe")
+            # Headless moderno y flags básicos
+            opts.add_argument("--headless=new")
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-dev-shm-usage")
+            opts.add_argument("--disable-gpu")
+            opts.add_argument("--disable-software-rasterizer")
+            opts.add_argument("--disable-extensions")
+            opts.add_argument("--no-first-run")
+            opts.add_argument("--no-zygote")
+            opts.add_argument("--window-size=1024,700")
+            opts.add_argument(f"--user-data-dir={tmp_dir}/user-data")
+            opts.add_argument(f"--data-path={tmp_dir}/data-path")
+            opts.add_argument(f"--disk-cache-dir={tmp_dir}/cache-dir")
 
-        # Estabilidad extra (evita throttling de timers, etc.)
-        chrome_options.add_argument("--disable-background-timer-throttling")
-        chrome_options.add_argument("--disable-renderer-backgrounding")
-        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
-        chrome_options.add_argument("--disable-features=Translate,BackForwardCache,MediaRouter")
-        chrome_options.add_argument("--ignore-certificate-errors")
+            # Estabilidad extra
+            opts.add_argument("--disable-background-timer-throttling")
+            opts.add_argument("--disable-renderer-backgrounding")
+            opts.add_argument("--disable-backgrounding-occluded-windows")
+            opts.add_argument("--disable-features=Translate,BackForwardCache,MediaRouter")
+            opts.add_argument("--ignore-certificate-errors")
 
-        # Optimización de consumo: sin scrollbars, escala 1, sin imágenes
-        chrome_options.add_argument("--hide-scrollbars")
-        chrome_options.add_argument("--force-device-scale-factor=1")
-        chrome_options.add_experimental_option(
-            "prefs",
-            {"profile.managed_default_content_settings.images": 2}
-        )
+            # Ahorro de RAM/I/O (omitidos en modo minimal)
+            if not minimal:
+                opts.add_argument("--hide-scrollbars")
+                opts.add_argument("--force-device-scale-factor=1")
+                opts.add_experimental_option(
+                    "prefs", {"profile.managed_default_content_settings.images": 2}
+                )
+            return opts
 
-        logger.info(f"[Selenium] CHROME_BIN={CHROME_BIN}")
-        logger.info(f"[Selenium] CHROMEDRIVER_PATH={CHROMEDRIVER_PATH}")
-        logger.info(f"[Selenium] which chromedriver={which_driver}, which chromium={which_chrome}")
+        def start_driver(options: Options):
+            if CHROMEDRIVER_PATH:
+                return webdriver.Chrome(service=Service(CHROMEDRIVER_PATH), options=options)
+            return webdriver.Chrome(options=options)
 
-        # Si tenemos ruta al driver la usamos; si no, que Selenium lo resuelva por PATH
-        if CHROMEDRIVER_PATH:
-            service = Service(CHROMEDRIVER_PATH)
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-        else:
-            self.driver = webdriver.Chrome(options=chrome_options)
+        logger.info(f"[Selenium] which chromium={which_chrome}, which chromedriver={which_driver}")
+        logger.info(f"[Selenium] env CHROME_BIN={env_chrome}, env CHROMEDRIVER_PATH={env_driver}")
+
+        # Intento 1: opciones optimizadas
+        try:
+            self.driver = start_driver(build_opts(minimal=False))
+        except Exception as e1:
+            logger.warning("Chrome no inició (optimizadas). Reintento con opciones mínimas. Error: %s", e1)
+            # Intento 2: opciones mínimas
+            self.driver = start_driver(build_opts(minimal=True))
 
         self.wait = WebDriverWait(self.driver, 15)
         logger.info("✅ Chrome inicializado en Railway")
@@ -152,7 +159,7 @@ class RailwayAvalPayCenterAutomation:
     # ---------- Utilidades/real ----------
     def _find_recaptcha_sitekey(self) -> Optional[str]:
         """Detecta la sitekey del reCAPTCHA en la página actual."""
-        # 1) iframe de anchor: .../api2/anchor?ar=1&k=<SITEKEY>...
+        # 1) iframe anchor: .../api2/anchor?ar=1&k=<SITEKEY>...
         try:
             iframe = self.wait.until(EC.presence_of_element_located(
                 (By.CSS_SELECTOR, "iframe[src*='api2/anchor']")))
@@ -163,7 +170,7 @@ class RailwayAvalPayCenterAutomation:
                 return sitekey
         except Exception:
             pass
-        # 2) data-sitekey directo en DOM
+        # 2) data-sitekey en DOM
         try:
             box = self.driver.find_element(By.CSS_SELECTOR, "[data-sitekey]")
             return box.get_attribute("data-sitekey")
@@ -177,10 +184,10 @@ class RailwayAvalPayCenterAutomation:
         Ajusta los selectores si el HTML cambia.
         """
         try:
-            # 1) Ir directo a la página de pago de facturadores (idConv=00000017)
+            # 1) Ir directo a la página
             self.driver.get(PAY_URL)
 
-            # 2) Encontrar el input de referencia (probamos varios selectores comunes)
+            # 2) Encontrar el input de referencia (varias heurísticas)
             used_field_sel = None
             field = None
             field_candidates = [
@@ -219,8 +226,6 @@ class RailwayAvalPayCenterAutomation:
 
             # 4) Click en el botón (Buscar / Continuar / Pagar)
             clicked = False
-
-            # por CSS
             btn_css_candidates = [
                 "button[type='submit']",
                 "input[type='submit']",
@@ -236,7 +241,6 @@ class RailwayAvalPayCenterAutomation:
                 except Exception:
                     pass
 
-            # si no, por texto con XPATH
             if not clicked:
                 xpath_candidates = [
                     "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'buscar')]",
@@ -253,7 +257,7 @@ class RailwayAvalPayCenterAutomation:
                     except Exception:
                         pass
 
-            # 5) Espera corta a que carguen resultados (ajustable)
+            # 5) Espera corta a que carguen resultados
             time.sleep(2.5)
 
             return {
@@ -268,7 +272,7 @@ class RailwayAvalPayCenterAutomation:
             return {"success": False, "error": str(e), "url": self.driver.current_url}
 
     def extract_payment_info_real(self) -> Dict[str, Any]:
-        """Ejemplo de extracción (ajusta selectores al HTML real)."""
+        """Extracción de datos básicos (ajusta selectores al HTML real)."""
         try:
             def txt(sel: str) -> Optional[str]:
                 try:
@@ -339,7 +343,7 @@ class RailwayAvalPayCenterAutomation:
                 jj = rr.json()
                 if jj.get("status") == 1:
                     token = jj["request"]
-                    # 3) Inyectar token
+                    # 3) Inyectar token en g-recaptcha-response
                     self.driver.execute_script("""
                         var el = document.getElementById('g-recaptcha-response');
                         if(!el){
@@ -426,7 +430,7 @@ def health_check():
         "success": True,
         "status": "healthy",
         "service": "AvalPayCenter Automation API",
-        "version": "3.7.0",
+        "version": "3.9.0",
         "selenium_import_ok": SELENIUM_IMPORT_OK,
         "enable_selenium": ENABLE_SELENIUM,
         "available_endpoints": [
