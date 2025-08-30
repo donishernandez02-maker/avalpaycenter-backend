@@ -15,6 +15,8 @@ from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 import requests
 
+automation_engine = None
+
 # ------------------------------------------------------------------------------
 # Logging (a stdout para que Railway lo capture)
 # ------------------------------------------------------------------------------
