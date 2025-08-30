@@ -1,4 +1,4 @@
-# avalpaycenter_pro.py — Backend para Railway (arranque rápido + Selenium opcional)
+# avalpaycenter_pro.py — Backend para Railway (Selenium opcional + 2captcha)
 # Universidad del Norte – Proyecto Final
 
 import os
@@ -33,8 +33,14 @@ CORS(app)
 app.url_map.strict_slashes = False  # acepta /ruta y /ruta/
 
 # ------------------------------------------------------------------------------
-# Selenium: import opcional (no bloquea arranque); enable por variable
+# Config y Selenium (import opcional)
 # ------------------------------------------------------------------------------
+ENABLE_SELENIUM = os.getenv("ENABLE_SELENIUM", "0") == "1"  # por defecto apagado
+PAY_URL = (
+    "https://www.avalpaycenter.com/wps/portal/portal-de-pagos/web/pagos-aval/"
+    "resultado-busqueda/realizar-pago-facturadores?idConv=00000017&origen=buscar"
+)
+
 SELENIUM_IMPORT_OK = False
 try:
     from selenium import webdriver
@@ -47,11 +53,10 @@ try:
 except Exception as e:
     logger.info("Selenium no disponible (import falló o no instalado): %s", e)
 
-ENABLE_SELENIUM = os.getenv("ENABLE_SELENIUM", "0") == "1"  # por defecto apagado
 automation_engine = None  # se creará bajo demanda
 
 # ------------------------------------------------------------------------------
-# Motor de automatización (mínimo viable + hooks para real)
+# Motor de automatización
 # ------------------------------------------------------------------------------
 class RailwayAvalPayCenterAutomation:
     """
@@ -59,7 +64,7 @@ class RailwayAvalPayCenterAutomation:
     Requisitos para modo REAL:
       - ENABLE_SELENIUM=1
       - NIXPACKS_PKGS="chromium chromedriver"
-      - (Opcional) 2CAPTCHA_API_KEY en Variables (o envíala en el body)
+      - (Opcional) 2CAPTCHA_API_KEY en Variables (o enviarla en el body)
     """
 
     def __init__(self):
@@ -67,7 +72,7 @@ class RailwayAvalPayCenterAutomation:
         if not SELENIUM_IMPORT_OK:
             raise RuntimeError("Selenium no está disponible en este entorno.")
 
-        # Preferir lo que esté en PATH (Nixpacks los deja en /root/.nix-profile/bin o /nix/store/.../bin)
+        # Preferir binarios en PATH (Nixpacks suele dejarlos en /root/.nix-profile/bin o /nix/store/.../bin)
         env_chrome = os.getenv("CHROME_BIN")
         env_driver = os.getenv("CHROMEDRIVER_PATH")
         which_chrome = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
@@ -151,20 +156,102 @@ class RailwayAvalPayCenterAutomation:
         except Exception:
             return None
 
-    def navigate_to_avalpaycenter_real(self, reference_number: str) -> Dict[str, Any]:
+    def navigate_to_avalpaycenter_real(self, reference_number: str, api_key_2captcha: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Abre la página de 'realizar-pago-facturadores', llena la referencia,
+        intenta resolver reCAPTCHA (si aparece) y envía el formulario.
+        Ajusta los selectores si el HTML cambia.
+        """
         try:
-            url = "https://www.avalpaycenter.com/"
-            self.driver.get(url)
-            # TODO: aquí van las interacciones reales (inputs/clicks) según el flujo
+            # 1) Ir directo a la página de pago de facturadores (idConv=00000017)
+            self.driver.get(PAY_URL)
+
+            # 2) Encontrar el input de referencia (probamos varios selectores comunes)
+            used_field_sel = None
+            field = None
+            field_candidates = [
+                "input[name*='referen' i]",
+                "input[id*='referen' i]",
+                "input[placeholder*='referen' i]",
+                "input[name*='codigo' i]",
+                "input[id*='codigo' i]",
+                "input[type='text']",
+            ]
+            for sel in field_candidates:
+                try:
+                    field = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+                    field.clear()
+                    field.send_keys(reference_number)
+                    used_field_sel = sel
+                    break
+                except Exception:
+                    continue
+
+            if not field:
+                return {
+                    "success": False,
+                    "error": "No se encontró el campo de referencia",
+                    "selectors_tried": field_candidates,
+                    "url": self.driver.current_url
+                }
+
+            # 3) Si hay reCAPTCHA, resolver antes de enviar (si recibimos API key)
+            captcha_info = None
+            if api_key_2captcha:
+                try:
+                    captcha_info = self.solve_recaptcha_real(api_key_2captcha)
+                except Exception as e:
+                    captcha_info = {"success": False, "error": str(e)}
+
+            # 4) Click en el botón (Buscar / Continuar / Pagar)
+            clicked = False
+
+            # por CSS
+            btn_css_candidates = [
+                "button[type='submit']",
+                "input[type='submit']",
+                "button[name*='buscar' i]",
+                "button[name*='continuar' i]",
+            ]
+            for sel in btn_css_candidates:
+                try:
+                    btn = self.driver.find_element(By.CSS_SELECTOR, sel)
+                    btn.click()
+                    clicked = True
+                    break
+                except Exception:
+                    pass
+
+            # si no, por texto con XPATH
+            if not clicked:
+                xpath_candidates = [
+                    "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'buscar')]",
+                    "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'continuar')]",
+                    "//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'pagar')]",
+                    "//input[@type='submit']",
+                ]
+                for xp in xpath_candidates:
+                    try:
+                        btn = self.driver.find_element(By.XPATH, xp)
+                        btn.click()
+                        clicked = True
+                        break
+                    except Exception:
+                        pass
+
+            # 5) Espera corta a que carguen resultados (ajustable)
+            time.sleep(2.5)
+
             return {
                 "success": True,
-                "navigated_url": url,
-                "reference": reference_number,
-                "ts": datetime.utcnow().isoformat() + "Z",
+                "navigated_url": self.driver.current_url,
+                "field_selector": used_field_sel,
+                "clicked": clicked,
+                "captcha": captcha_info
             }
         except Exception as e:
-            logger.exception("Falló la navegación REAL")
-            return {"success": False, "error": str(e)}
+            logger.exception("navigate_to_avalpaycenter_real fallo")
+            return {"success": False, "error": str(e), "url": self.driver.current_url}
 
     def extract_payment_info_real(self) -> Dict[str, Any]:
         """Ejemplo de extracción (ajusta selectores al HTML real)."""
@@ -319,7 +406,7 @@ def health_check():
         "success": True,
         "status": "healthy",
         "service": "AvalPayCenter Automation API",
-        "version": "3.4.0",
+        "version": "3.5.0",
         "selenium_import_ok": SELENIUM_IMPORT_OK,
         "enable_selenium": ENABLE_SELENIUM,
         "available_endpoints": [
@@ -347,7 +434,7 @@ def search_reference():
         if not engine:
             return jsonify(demo_result(ref)), 200
 
-        nav = engine.navigate_to_avalpaycenter_real(ref)
+        nav = engine.navigate_to_avalpaycenter_real(ref, os.getenv("2CAPTCHA_API_KEY"))
         if not nav.get("success"):
             return jsonify({"success": False, "error": "No se pudo navegar", "details": nav}), 500
 
@@ -394,15 +481,21 @@ def complete_automation():
             }), 200
 
         steps = []
-        nav = engine.navigate_to_avalpaycenter_real(ref)
+
+        # 1) Navegar + llenar + (si hay) resolver captcha + submit
+        nav = engine.navigate_to_avalpaycenter_real(ref, api_key)
         steps.append({"step": 1, "name": "navigation", "result": nav})
         if not nav.get("success"):
             return jsonify({"success": False, "steps": steps, "error": "Navegación falló"}), 500
 
+        # 2) Extraer información del resultado
         extracted = engine.extract_payment_info_real()
         steps.append({"step": 2, "name": "extraction", "result": extracted})
 
-        captcha = engine.solve_recaptcha_real(api_key)
+        # 3) Resultado de captcha (si navigate ya lo resolvió, úsalo; si no, intenta ahora)
+        captcha = nav.get("captcha")
+        if not isinstance(captcha, dict):
+            captcha = engine.solve_recaptcha_real(api_key)
         steps.append({"step": 3, "name": "captcha", "result": captcha})
 
         ok = nav.get("success") and extracted.get("success") and captcha.get("success", True)
