@@ -1,22 +1,18 @@
-# avalpaycenter_pro.py — Backend REAL para Railway (arranque rápido)
+# avalpaycenter_pro.py — Backend para Railway (arranque rápido + Selenium opcional)
 # Universidad del Norte – Proyecto Final
-# ✔ Healthcheck instantáneo
-# ✔ Inicialización perezosa de Selenium (ENABLE_SELENIUM=1)
-# ✔ Rutas con y sin "/" (strict_slashes=False)
-# ✔ Fallback seguro si no hay Selenium/Chrome
 
 import os
 import sys
 import logging
-from datetime import datetime
 from typing import Optional, Dict, Any
+from datetime import datetime
 
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 import requests
 
 # ------------------------------------------------------------------------------
-# Logging básico (a stdout para que Railway lo capture)
+# Logging (a stdout para que Railway lo capture)
 # ------------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -33,14 +29,14 @@ CORS(app)
 app.url_map.strict_slashes = False  # acepta /ruta y /ruta/
 
 # ------------------------------------------------------------------------------
-# Selenium opcional (no bloquea el arranque)
+# Selenium: import opcional (no bloquea arranque); enable por variable
 # ------------------------------------------------------------------------------
 SELENIUM_IMPORT_OK = False
 try:
-    # Solo importamos; NO iniciamos Chrome aquí
     from selenium import webdriver
     from selenium.webdriver.common.by import By
     from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     SELENIUM_IMPORT_OK = True
@@ -51,41 +47,72 @@ ENABLE_SELENIUM = os.getenv("ENABLE_SELENIUM", "0") == "1"  # por defecto apagad
 automation_engine = None  # se creará bajo demanda
 
 
+# ------------------------------------------------------------------------------
+# Motor de automatización (mínimo viable + hooks para real)
+# ------------------------------------------------------------------------------
 class RailwayAvalPayCenterAutomation:
     """
-    Motor muy simple de demostración. Si quieres navegación REAL,
-    activa ENABLE_SELENIUM=1 y añade NIXPACKS_PKGS='chromium chromedriver' en Railway.
+    Motor de demostración. Para navegación REAL en Railway, define:
+    - ENABLE_SELENIUM=1
+    - NIXPACKS_PKGS='chromium chromedriver'
+    (Opcional) CHROME_BIN, CHROMEDRIVER_PATH
     """
 
     def __init__(self):
         if not SELENIUM_IMPORT_OK:
             raise RuntimeError("Selenium no está disponible en este entorno.")
 
+        # Rutas por defecto de Nixpacks (Railway) + override por variables
+        CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium")
+        CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+
+        logger.info(f"Usando CHROME_BIN={CHROME_BIN} (exists={os.path.exists(CHROME_BIN)})")
+        logger.info(f"Usando CHROMEDRIVER_PATH={CHROMEDRIVER_PATH} (exists={os.path.exists(CHROMEDRIVER_PATH)})")
+
         chrome_options = Options()
+        chrome_options.binary_location = CHROME_BIN
         chrome_options.add_argument("--headless=new")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--window-size=1280,800")
+        chrome_options.add_argument("--remote-debugging-port=9222")
 
-        # Intentar Chrome/Chromedriver del sistema (NIXPACKS_PKGS)
-        self.driver = webdriver.Chrome(options=chrome_options)
+        service = Service(CHROMEDRIVER_PATH)
+        try:
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        except Exception as e:
+            logger.warning("Primer intento de Chrome falló (%s). Probando rutas alternas…", e)
+            # Alternativas comunes en imágenes Debian/Ubuntu
+            alt_bin = "/usr/bin/chromium-browser"
+            alt_drv = "/usr/lib/chromium/chromedriver"
+            if os.path.exists(alt_bin):
+                chrome_options.binary_location = alt_bin
+            if os.path.exists(alt_drv):
+                service = Service(alt_drv)
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+
         self.wait = WebDriverWait(self.driver, 15)
-        logger.info("✅ Chrome inicializado")
+        logger.info("✅ Chrome inicializado en Railway")
 
     def navigate_to_avalpaycenter_real(self, reference_number: str) -> Dict[str, Any]:
         try:
             url = "https://www.avalpaycenter.com/"
             self.driver.get(url)
-            # Aquí iría la interacción real con el sitio, inputs, etc.
-            return {"success": True, "navigated_url": url, "reference": reference_number}
+            # Aquí irían interacciones reales con el sitio (inputs/botones/etc)
+            return {
+                "success": True,
+                "navigated_url": url,
+                "reference": reference_number,
+                "ts": datetime.utcnow().isoformat() + "Z",
+            }
         except Exception as e:
             logger.exception("Falló la navegación REAL")
             return {"success": False, "error": str(e)}
 
     def extract_payment_info_real(self) -> Dict[str, Any]:
         try:
-            # Demo: en un caso real, extraes datos del DOM
+            # En un caso real, se extrae del DOM. Demo:
             info = {
                 "entity": "AvalPayCenter",
                 "customer_name": "N/A",
@@ -115,7 +142,7 @@ class RailwayAvalPayCenterAutomation:
 def get_engine() -> Optional[RailwayAvalPayCenterAutomation]:
     """
     Crea el motor SOLO cuando lo piden y si Selenium está habilitado por env.
-    Evita que el contenedor tarde en iniciar.
+    Evita que el contenedor tarde en iniciar por el healthcheck.
     """
     global automation_engine
     if not ENABLE_SELENIUM or not SELENIUM_IMPORT_OK:
@@ -160,14 +187,15 @@ def demo_result(reference: str) -> Dict[str, Any]:
 def root():
     return redirect("/api/health", code=302)
 
+
 @app.route("/api/health", methods=["GET"])
 @app.route("/api/health/", methods=["GET"])
 def health_check():
     return jsonify({
         "success": True,
         "status": "healthy",
-        "service": "AvalPayCenter REAL Automation API",
-        "version": "3.0.0",
+        "service": "AvalPayCenter Automation API",
+        "version": "3.1.0",
         "selenium_import_ok": SELENIUM_IMPORT_OK,
         "enable_selenium": ENABLE_SELENIUM,
         "available_endpoints": [
@@ -176,7 +204,9 @@ def health_check():
             "POST /api/solve-captcha - Resolver reCAPTCHA REAL",
             "POST /api/complete-automation - Automatización COMPLETA",
             "GET /api/session-info - Estado de la sesión",
-            "GET /api/test-avalpaycenter - Probar conexión"
+            "GET /api/test-avalpaycenter - Probar conexión",
+            "GET /api/_routes - (debug) rutas cargadas",
+            "GET /api/_engine - (debug) inicializar/ver estado del motor"
         ]
     }), 200
 
@@ -295,6 +325,31 @@ def test_avalpaycenter():
         return jsonify({"success": False, "error": str(e)}), 200
 
 
+# -------------------------- Endpoints de debug -------------------------------
+@app.route('/api/_routes', methods=['GET'])
+@app.route('/api/_routes/', methods=['GET'])
+def list_routes():
+    """Lista las rutas realmente cargadas por esta release."""
+    rules = []
+    for r in app.url_map.iter_rules():
+        methods = sorted([m for m in r.methods if m not in ('HEAD', 'OPTIONS')])
+        rules.append({"rule": str(r), "endpoint": r.endpoint, "methods": methods})
+    return jsonify({"success": True, "count": len(rules), "routes": rules}), 200
+
+
+@app.route('/api/_engine', methods=['GET'])
+@app.route('/api/_engine/', methods=['GET'])
+def force_init_engine():
+    """Intenta inicializar el motor y reporta su estado (para diagnóstico)."""
+    try:
+        eng = get_engine()
+        if eng and getattr(eng, "driver", None):
+            return jsonify({"success": True, "engine": "activo"}), 200
+        return jsonify({"success": False, "engine": "no inicializado"}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 200
+
+
 # ------------------------------------------------------------------------------
 # Handler 404 (muestra endpoints)
 # ------------------------------------------------------------------------------
@@ -309,7 +364,9 @@ def not_found(_e):
             "POST /api/solve-captcha - Resolver reCAPTCHA REAL",
             "POST /api/complete-automation - Automatización COMPLETA",
             "GET /api/session-info - Estado de la sesión",
-            "GET /api/test-avalpaycenter - Probar conexión"
+            "GET /api/test-avalpaycenter - Probar conexión",
+            "GET /api/_routes - (debug) rutas cargadas",
+            "GET /api/_engine - (debug) inicializar/ver estado del motor"
         ]
     }), 404
 
@@ -320,6 +377,6 @@ def not_found(_e):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     host = "0.0.0.0"
-    logger.info("🚀 Iniciando API en http://%s:%s (selenium=%s, enable=%s)",
+    logger.info("🚀 Iniciando API en http://%s:%s (selenium_import_ok=%s, enable=%s)",
                 host, port, SELENIUM_IMPORT_OK, ENABLE_SELENIUM)
     app.run(host=host, port=port)
