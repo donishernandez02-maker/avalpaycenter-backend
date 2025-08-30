@@ -609,6 +609,7 @@ except Exception as e:
 # ================================
 
 @app.route('/api/health', methods=['GET'])
+@app.route('/api/health/', methods=['GET'])
 def health_check():
     """Verificar estado de la API"""
     selenium_status = "disponible" if SELENIUM_AVAILABLE else "no disponible"
@@ -636,6 +637,8 @@ def health_check():
     })
 
 @app.route('/api/search-reference', methods=['POST'])
+@app.route('/api/search-reference/', methods=['POST'])
+
 def search_reference():
     """Buscar información REAL de cualquier referencia en AvalPayCenter"""
     try:
@@ -688,6 +691,7 @@ def search_reference():
         }), 500
 
 @app.route('/api/solve-captcha', methods=['POST'])
+@app.route('/api/solve-captcha/', methods=['POST'])
 def solve_captcha():
     """Resolver reCAPTCHA REAL en la página actual"""
     try:
@@ -711,6 +715,7 @@ def solve_captcha():
         }), 500
 
 @app.route('/api/complete-automation', methods=['POST'])
+@app.route('/api/complete-automation/', methods=['POST'])
 def complete_automation():
     """Automatización COMPLETA y REAL para cualquier referencia"""
     try:
@@ -790,6 +795,8 @@ def complete_automation():
         }), 500
 
 @app.route('/api/session-info', methods=['GET'])
+@app.route('/api/session-info/', methods=['GET'])
+
 def session_info():
     """Información del estado actual del sistema"""
     try:
@@ -819,6 +826,8 @@ def session_info():
         }), 500
 
 @app.route('/api/test-avalpaycenter', methods=['GET'])
+@app.route('/api/test-avalpaycenter/', methods=['GET'])
+
 def test_avalpaycenter():
     """Probar conexión directa con AvalPayCenter"""
     try:
